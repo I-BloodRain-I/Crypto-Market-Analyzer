@@ -32,10 +32,8 @@ import requests
 from requests.adapters import HTTPAdapter
 
 DATA_FOLDER = Path.cwd() / "data"
-RAW_FOLDER = DATA_FOLDER / "raw"
-RAW_FOLDER.mkdir(exist_ok=True, parents=True)
-PROCESSED_FOLDER = DATA_FOLDER / "processed"
-PROCESSED_FOLDER.mkdir(exist_ok=True, parents=True)
+DOWNLOADED_FOLDER = DATA_FOLDER / "downloaded"
+DOWNLOADED_FOLDER.mkdir(exist_ok=True, parents=True)
 
 BASIC_URL = "https://data.binance.vision/data/futures/um/daily"
 
@@ -204,7 +202,7 @@ if __name__ == "__main__":
     parser.add_argument("--interval", default="1m", help="Kline interval, e.g. 1m, 1h, 1d")
     parser.add_argument("--start", required=True, help="Start date DD-MM-YYYY")
     parser.add_argument("--end", required=True, help="End date DD-MM-YYYY")
-    parser.add_argument("--dest", default=str(RAW_FOLDER), help="Destination folder to save zips")
+    parser.add_argument("--dest", default=str(DOWNLOADED_FOLDER), help="Destination folder to save zips")
     parser.add_argument("--retries", type=int, default=5, help="Number of request retries")
     parser.add_argument("--timeout", type=float, default=10.0, help="Per-request timeout in seconds")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
@@ -223,19 +221,23 @@ if __name__ == "__main__":
         else:
             session = _create_session(retries=args.retries)
 
-        download_klines(
-            args.symbol,
-            args.interval,
-            args.start,
-            args.end,
-            dest,
-            session=session,
-            timeout=args.timeout,
-            overwrite=args.overwrite,
-            max_workers=args.workers,
-            retries=args.retries,
-            backoff_factor=0.5,
-        )
+        # Second run just to ensure all files are downloaded
+        for i in range(2):
+            if i == 1:
+                logger.setLevel(logging.WARNING)
+            download_klines(
+                args.symbol,
+                args.interval,
+                args.start,
+                args.end,
+                dest,
+                session=session,
+                timeout=args.timeout,
+                overwrite=args.overwrite,
+                max_workers=args.workers,
+                retries=args.retries,
+                backoff_factor=0.5,
+            )
     except Exception as exc:
         logger.exception("Error: %s", exc)
         sys.exit(1)
