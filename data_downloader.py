@@ -1,17 +1,17 @@
 """
-Download Binance futures kline .zip files by date range.
+Download Binance futures data .zip files by date range.
 
 Usage examples:
     python data_downloader.py --start 01-01-2023 --end 05-01-2023
     python data_downloader.py --symbol BTCUSDT --interval 1m --start 01-01-2023 --end 05-01-2023 \
-        --workers 4 --retries 5 --timeout 10 --dest data/raw --overwrite
+        --workers 4 --retries 5 --timeout 10 --dest data/downloaded --overwrite
 
 Arguments:
     --symbol    Trading pair symbol (default: BTCUSDT)
     --interval  Kline interval, e.g. 1m, 1h, 1d (default: 1m)
     --start     Start date in DD-MM-YYYY (required)
     --end       End date in DD-MM-YYYY (required)
-    --dest      Destination folder to save zips (default: data/raw)
+    --dest      Destination folder to save zips (default: data/downloaded)
     --retries   Number of request retries (default: 5)
     --timeout   Per-request timeout in seconds (default: 10.0)
     --overwrite Overwrite existing files (flag)
@@ -36,6 +36,7 @@ DOWNLOADED_FOLDER = DATA_FOLDER / "downloaded"
 DOWNLOADED_FOLDER.mkdir(exist_ok=True, parents=True)
 
 BASIC_URL = "https://data.binance.vision/data/futures/um/daily"
+ENDPOINTS = ("klines", "bookDepth", "bookTicker", "metrics")
 
 logger = logging.getLogger(__name__)
 
@@ -64,98 +65,112 @@ def _create_session(retries: int = 5, backoff_factor: float = 0.5):
     return session
 
 
-def download_klines(
-    symbol: str,
-    interval: str,
-    start_str: str,
-    end_str: str,
-    save_path: Path,
-    session: Optional[requests.Session] = None,
-    timeout: float = 10.0,
-    chunk_size: int = 1024 * 64,
-    overwrite: bool = False,
-    max_workers: int = 4,
-    retries: int = 5,
-    backoff_factor: float = 0.5,
-) -> List[Tuple[Path, str]]:
+class BinanceDataDownloader:
+    """Downloader for Binance compressed files.
+
+    This class encapsulates the logic to download daily compressed files from
+    Binance (for example `klines` or `bookDepth`) for a given symbol,
+    interval and date range. It handles session creation with retries,
+    streaming downloads to temporary files, and optional multithreaded
+    execution.
     """
-    Download historical kline data from Binance.
 
-    Args:
-        symbol: Trading pair symbol, e.g. 'BTCUSDT'.
-        interval: Kline interval, e.g. '1m', '1h', '1d'.
-        start_str: Start date in 'DD-MM-YYYY' format.
-        end_str: End date in 'DD-MM-YYYY' format.
-        save_path: Directory where .zip files will be saved; created if missing.
-        session: Optional requests.Session to reuse for sequential runs. If None and
-            max_workers > 1, a per-thread session is created for each worker.
-        timeout: Per-request timeout in seconds.
-        chunk_size: Bytes to read per iteration when streaming responses.
-        overwrite: If True, overwrite existing files; otherwise skip non-empty files.
-        max_workers: Number of worker threads to use (1 = sequential). Clamped to
-            the number of dates being downloaded.
-        retries: Total number of request retries handled by urllib3 Retry.
-        backoff_factor: Backoff factor for retries.
+    def __init__(
+        self,
+        symbol: str,
+        interval: str,
+        start_str: str,
+        end_str: str,
+        save_path: Path,
+        endpoint: str = "klines",
+        session: Optional[requests.Session] = None,
+        timeout: float = 10.0,
+        chunk_size: int = 1024 * 64,
+        overwrite: bool = False,
+        max_workers: int = 4,
+        retries: int = 5,
+        backoff_factor: float = 0.5,
+    ) -> None:
+        """Initialize the downloader with the requested configuration.
 
-    Returns:
-        A list of tuples (path, status) where status is one of:
-        'downloaded', 'skipped', 'http_error', 'network_error'.
+        Args:
+            symbol: Trading pair symbol (e.g. BTCUSDT).
+            interval: Kline interval (e.g. 1m, 1h, 1d).
+            start_str: Start date in DD-MM-YYYY format.
+            end_str: End date in DD-MM-YYYY format.
+            save_path: Directory where downloaded .zip files will be saved.
+            endpoint: API endpoint path segment to download from (e.g. klines or bookDepth).
+            session: Optional requests.Session to reuse for sequential runs; if None
+                and multithreading is used, per-thread sessions are created.
+            timeout: Per-request timeout in seconds.
+            chunk_size: Bytes to read per iteration when streaming responses.
+            overwrite: If True, overwrite existing files; otherwise skip non-empty files.
+            max_workers: Number of worker threads to use (1 = sequential).
+            retries: Number of request retries handled by urllib3 Retry.
+            backoff_factor: Backoff factor for retries.
 
-    Raises:
-        ValueError: If start_date is after end_date.
+        Raises:
+            ValueError: If start_date is after end_date.
+        """
+        self.symbol = symbol
+        self.interval = interval
+        self.start_str = start_str
+        self.end_str = end_str
+        self.save_path = save_path
+        self.endpoint = endpoint
+        self.session = session
+        self.timeout = timeout
+        self.chunk_size = chunk_size
+        self.overwrite = overwrite
+        self.max_workers = max_workers
+        self.retries = retries
+        self.backoff_factor = backoff_factor
 
-    Notes:
-        - Downloads stream to a temporary '.part' file and are atomically replaced on
-          success to avoid partial files.
-        - For multithreaded downloads, thread-local requests.Session objects are used
-          to avoid sharing sessions across threads.
-        - Existing non-empty files are skipped unless overwrite=True.
-    """
-    start_date = datetime.strptime(start_str, "%d-%m-%Y")
-    end_date = datetime.strptime(end_str, "%d-%m-%Y")
-    if start_date > end_date:
-        raise ValueError("start date must be <= end date")
+        # prepare dates
+        start_date = datetime.strptime(start_str, "%d-%m-%Y")
+        end_date = datetime.strptime(end_str, "%d-%m-%Y")
+        if start_date > end_date:
+            raise ValueError("start date must be <= end date")
+        self.dates = []
+        cur = start_date
+        while cur <= end_date:
+            self.dates.append(cur)
+            cur += timedelta(days=1)
 
-    save_path.mkdir(parents=True, exist_ok=True)
+        # clamp workers
+        if self.max_workers is None:
+            self.max_workers = 1
+        self.max_workers = max(1, min(self.max_workers, len(self.dates)))
 
-    dates = []
-    cur = start_date
-    while cur <= end_date:
-        dates.append(cur)
-        cur += timedelta(days=1)
+        # thread local for sessions used in multithreaded mode
+        self._thread_local = threading.local()
 
-    if max_workers is None:
-        max_workers = 1
-    max_workers = max(1, min(max_workers, len(dates)))
+    def _get_thread_session(self) -> requests.Session:
+        if getattr(self._thread_local, "session", None) is None:
+            self._thread_local.session = _create_session(retries=self.retries, backoff_factor=self.backoff_factor)
+        return self._thread_local.session
 
-    thread_local = threading.local()
+    def _download_for_date(self, cur_date: datetime) -> Tuple[Path, str]:
+        file_name = self._resolve_file_name(cur_date)
+        out_file = self.save_path / file_name.replace(".zip", f"_{self.endpoint}.zip")
+        url = self._resolve_url(file_name)
 
-    def _get_thread_session() -> requests.Session:
-        if getattr(thread_local, "session", None) is None:
-            thread_local.session = _create_session(retries=retries, backoff_factor=backoff_factor)
-        return thread_local.session
-
-    def _download_for_date(cur_date: datetime):
-        date_str = cur_date.strftime("%Y-%m-%d")
-        file_name = f"{symbol}-{interval}-{date_str}.zip"
-        out_file = save_path / file_name
-        url = f"{BASIC_URL}/klines/{symbol}/{interval}/{file_name}"
-
-        if out_file.exists() and not overwrite and out_file.stat().st_size > 0:
+        if out_file.exists() and not self.overwrite and out_file.stat().st_size > 0:
             logger.info("Skipping existing file %s", file_name)
             return out_file, "skipped"
 
-        if max_workers > 1:
-            sess = _get_thread_session()
+        if self.max_workers > 1:
+            sess = self._get_thread_session()
         else:
-            sess = session or _create_session(retries=retries, backoff_factor=backoff_factor)
+            sess = self.session or _create_session(retries=self.retries, backoff_factor=self.backoff_factor)
 
         tmp_file = out_file.with_suffix(".part")
         try:
-            with sess.get(url, timeout=timeout, stream=True) as response:
+            with sess.get(url, timeout=self.timeout, stream=True) as response:
                 response.raise_for_status()
+                self.save_path.mkdir(parents=True, exist_ok=True)
                 with open(tmp_file, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=chunk_size):
+                    for chunk in response.iter_content(chunk_size=self.chunk_size):
                         if chunk:
                             f.write(chunk)
                 tmp_file.replace(out_file)
@@ -179,21 +194,49 @@ def download_klines(
                 pass
             return out_file, "network_error"
 
-    results: List[Tuple[Path, str]] = []
-    if max_workers > 1:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_download_for_date, d): d for d in dates}
-            for fut in as_completed(futures):
-                try:
-                    res = fut.result()
-                    results.append(res)
-                except Exception as exc:
-                    logger.exception("Download task raised: %s", exc)
-    else:
-        for d in dates:
-            results.append(_download_for_date(d))
+    def _resolve_file_name(self, cur_date: datetime) -> str:
+        date_str = cur_date.strftime("%Y-%m-%d")
+        if self.endpoint == "klines":
+            file_name = f"{self.symbol}-{self.interval}-{date_str}.zip"
+        elif self.endpoint in ["bookDepth", "bookTicker", "metrics"]:
+            file_name = f"{self.symbol}-{self.endpoint}-{date_str}.zip"
+        else:
+            raise ValueError(f"Unknown endpoint: {self.endpoint}")
+        return file_name
 
-    return results
+    def _resolve_url(self, file_name: str) -> str:
+        if self.endpoint == "klines":
+            url = f"{BASIC_URL}/{self.endpoint}/{self.symbol}/{self.interval}/{file_name}"
+        elif self.endpoint in ["bookDepth", "bookTicker", "metrics"]:
+            url = f"{BASIC_URL}/{self.endpoint}/{self.symbol}/{file_name}"
+        else:
+            raise ValueError(f"Unknown endpoint: {self.endpoint}")
+        return url
+
+    def download(self) -> List[Tuple[Path, str]]:
+        """Download files for the configured date range.
+
+        The method will perform the downloads sequentially or concurrently
+        depending on the configuration provided to the initializer.
+
+        Returns:
+            A list of tuples (path, status) where status is one of:
+            'downloaded', 'skipped', 'http_error', 'network_error'.
+        """
+        results: List[Tuple[Path, str]] = []
+        if self.max_workers > 1:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {executor.submit(self._download_for_date, d): d for d in self.dates}
+                for fut in as_completed(futures):
+                    try:
+                        res = fut.result()
+                        results.append(res)
+                    except Exception as exc:
+                        logger.exception("Download task raised: %s", exc)
+        else:
+            for d in self.dates:
+                results.append(self._download_for_date(d))
+        return results
 
 
 if __name__ == "__main__":
@@ -205,12 +248,17 @@ if __name__ == "__main__":
     parser.add_argument("--dest", default=str(DOWNLOADED_FOLDER), help="Destination folder to save zips")
     parser.add_argument("--retries", type=int, default=5, help="Number of request retries")
     parser.add_argument("--timeout", type=float, default=10.0, help="Per-request timeout in seconds")
+    parser.add_argument("--endpoint", required=True, help="API endpoint to download from, e.g. klines or bookDepth")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
     parser.add_argument("--workers", type=int, default=4, help="Number of download threads to use (1 = sequential)")
 
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.endpoint not in ENDPOINTS:
+        logger.error(f"Invalid endpoint specified. Supported endpoints: {ENDPOINTS}.")
+        sys.exit(1)
 
     try:
         dest = Path(args.dest)
@@ -225,19 +273,22 @@ if __name__ == "__main__":
         for i in range(2):
             if i == 1:
                 logger.setLevel(logging.WARNING)
-            download_klines(
+            downloader = BinanceDataDownloader(
                 args.symbol,
                 args.interval,
                 args.start,
                 args.end,
                 dest,
+                endpoint=args.endpoint,
                 session=session,
                 timeout=args.timeout,
+                chunk_size=1024 * 64,
                 overwrite=args.overwrite,
                 max_workers=args.workers,
                 retries=args.retries,
                 backoff_factor=0.5,
             )
+            downloader.download()
     except Exception as exc:
         logger.exception("Error: %s", exc)
         sys.exit(1)
