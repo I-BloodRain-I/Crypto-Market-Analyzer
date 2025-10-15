@@ -1,3 +1,6 @@
 .venv/
 .vscode/
-data/
+.github/
+notes/
+/data/
+__pycache__/
