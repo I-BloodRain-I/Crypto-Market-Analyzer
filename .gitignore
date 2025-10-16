@@ -1,6 +1,7 @@
-.venv/
-.vscode/
-.github/
-notes/
+/.venv/
+/.vscode/
+/.github/
+/notes/
 /data/
+/experiments/
 __pycache__/
