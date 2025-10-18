@@ -22,8 +22,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torchmetrics import Accuracy, Precision, Recall, F1Score
+from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
+from torchmetrics import Accuracy, Precision, Recall, F1Score
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -186,6 +187,8 @@ class Trainer:
         loss_fn: nn.Module,
         device: torch.device,
         use_amp: bool = False,
+        log_dir: Optional[str] = None,
+        writer: Optional[SummaryWriter] = None,
     ):
         """Create a Trainer instance.
 
@@ -195,6 +198,9 @@ class Trainer:
             loss_fn: Loss function used to compute gradients during training.
             device: Device where model and data tensors will be placed.
             use_amp: Whether to enable automatic mixed precision (requires CUDA).
+            log_dir: Optional path to a TensorBoard log directory. If provided and
+                ``writer`` is not supplied, a SummaryWriter will be created.
+            writer: Optional externally-created SummaryWriter instance to use.
         """
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -211,6 +217,65 @@ class Trainer:
         self.use_amp = use_amp
         self.scaler = GradScaler() if self.use_amp else None
 
+        # TensorBoard writer handling
+        self.writer = writer if writer is not None else (SummaryWriter(log_dir) if log_dir is not None else None)
+        self._owns_writer = (writer is None) and (log_dir is not None)
+
+    def _log_model_graph(self, data_loader: Optional[DataLoader] = None, example_input: Optional[Any] = None) -> None:
+        """Log the model graph to TensorBoard using an example input.
+
+        The method attempts to use ``example_input`` if provided; otherwise it will
+        try to pull a single batch from ``data_loader``. Handles single-tensor
+        inputs as well as list/tuple inputs (for models accepting multiple inputs).
+
+        Args:
+            data_loader: DataLoader to draw a single batch from when ``example_input`` is not provided.
+            example_input: Optional example input compatible with the model. Can be a
+                tensor, tuple, list or other object the model accepts.
+        """
+        if self.writer is None:
+            return
+
+        inp = example_input
+        if inp is None and data_loader is not None:
+            try:
+                batch = next(iter(data_loader))
+            except Exception as e:
+                logger.warning(f"Unable to fetch a batch from DataLoader to log model graph: {e}")
+                return
+            # Expecting (x_batch, y_batch) tuples from the DataLoader
+            if isinstance(batch, (list, tuple)) and len(batch) >= 1:
+                inp = batch[0]
+            else:
+                inp = batch
+
+        if inp is None:
+            logger.warning("No example input available to log model graph")
+            return
+
+        try:
+            if isinstance(inp, (list, tuple)):
+                prepared = []
+                for x in inp:
+                    if isinstance(x, torch.Tensor):
+                        prepared.append(x.to(self.device))
+                    else:
+                        prepared.append(x)
+                prepared_inp = tuple(prepared)
+            elif isinstance(inp, torch.Tensor):
+                prepared_inp = inp.to(self.device)
+            else:
+                prepared_inp = inp
+
+            try:
+                self.writer.add_graph(self.model, prepared_inp)
+                self.writer.flush()
+                logger.info("Model graph written to TensorBoard")
+            except Exception as e:
+                logger.warning(f"Failed to write model graph to TensorBoard: {e}")
+        except Exception as e:
+            logger.warning(f"Error preparing example input for model graph: {e}")
+
     def train(
         self, 
         num_epochs: int, 
@@ -219,6 +284,8 @@ class Trainer:
         test_loader: Optional[DataLoader] = None,
         metrics: List[Any] = [],
         early_stopping: Optional[Dict[str, Any]] = None,
+        log_graph: bool = False,
+        example_input: Optional[Any] = None,
     ):
         """Run the training loop with validation, logging and optional early stopping.
 
@@ -230,17 +297,35 @@ class Trainer:
             metrics: List of torchmetrics metric instances to evaluate during training and validation.
             early_stopping: Optional mapping used to construct an EarlyStopping instance
                 (e.g. {"monitor": "loss", "patience": 3}). If omitted, early stopping is disabled.
+            log_graph: Optional flag to log the model graph to TensorBoard once before training.
+            example_input: Optional example input for logging the model graph. Overrides
+                ``log_graph`` if provided.
         """
         train_metrics_eval = MetricsEvaluator(metrics, self.device)
         val_metrics_eval = MetricsEvaluator(metrics, self.device)
 
         stopper = EarlyStopping(**early_stopping) if early_stopping else None
 
+        # Optionally log the model graph once before training
+        if log_graph and self.writer is not None:
+            self._log_model_graph(data_loader=train_loader, example_input=example_input)
+        
         for epoch in range(num_epochs):
             self._train(train_loader, train_metrics_eval)
             self._test(val_loader, val_metrics_eval)
             self.log(epoch, train_metrics_eval, val_metrics_eval)
 
+            # Write metrics to TensorBoard
+            if self.writer is not None:
+                train_results = train_metrics_eval.compute_metrics()
+                val_results = val_metrics_eval.compute_metrics()
+                step = epoch + 1
+                for key, val in train_results.items():
+                    self.writer.add_scalar(f"train/{key}", float(val), step)
+                for key, val in val_results.items():
+                    self.writer.add_scalar(f"val/{key}", float(val), step)
+
+            # Early stopping check
             if stopper:
                 val_results = val_metrics_eval.compute_metrics()
                 monitor_value = val_results.get(stopper.monitor)
@@ -263,7 +348,17 @@ class Trainer:
             test_metrics_eval = MetricsEvaluator(metrics, self.device)
             self._test(test_loader, test_metrics_eval)
             logger.info(f"Test Metrics: {test_metrics_eval.format_metrics_to_log()}")
-            
+
+            if self.writer is not None:
+                test_results = test_metrics_eval.compute_metrics()
+                step = num_epochs
+                for key, val in test_results.items():
+                    self.writer.add_scalar(f"test/{key}", float(val), step)
+
+        if self.writer is not None and self._owns_writer:
+            self.writer.flush()
+            self.writer.close()
+
     def _train(self, train_loader: DataLoader, metrics_eval: MetricsEvaluator) -> None:
         """Perform a single training epoch over the provided DataLoader.
 
@@ -371,8 +466,20 @@ if __name__ == "__main__":
     trainer = Trainer(model, optimizer, loss_fn, device, use_amp=True)
 
     # Dummy DataLoader for illustration; replace with actual data loaders
-    train_loader = DataLoader([(torch.randn(10), torch.randint(0, 2, (1,)).item()) for _ in range(100)], batch_size=32)
-    val_loader = DataLoader([(torch.randn(10), torch.randint(0, 2, (1,)).item()) for _ in range(20)], batch_size=32)
+    train_loader = DataLoader(
+        [(
+            torch.randn(10), 
+            torch.randint(0, 2, (1,)).item()
+        ) for _ in range(100)], 
+        batch_size=32
+    )
+    val_loader = DataLoader(
+        [(
+            torch.randn(10), 
+            torch.randint(0, 2, (1,)).item()
+        ) for _ in range(20)], 
+        batch_size=32
+    )
 
     trainer.train(
         num_epochs=50, 
