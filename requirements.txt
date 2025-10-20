@@ -12,3 +12,5 @@ scikit-learn==1.7.2
 pydantic==2.11.10
 mplfinance==0.12.10b0
 torchmetrics==1.8.2
+tensorboard==2.20.0
+torchinfo==1.8.0

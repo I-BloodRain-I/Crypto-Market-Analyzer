@@ -1,1 +1,1 @@
-from .sliding_window import SlidingWindowDataset
+from .multi_horizon import MultiHorizonDataset

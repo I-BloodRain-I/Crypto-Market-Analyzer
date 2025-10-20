@@ -1,5 +1,4 @@
 import os
-from re import S
 from typing import Union, List, Optional
 
 import torch
@@ -9,9 +8,9 @@ import pyarrow.parquet as pq
 from torch.utils.data import Dataset
 
 
-class SlidingWindowDataset(Dataset):
+class MultiHorizonDataset(Dataset):
     """
-    Fast sliding-window dataset backed by PyArrow parquet.
+    Fast multi-horizon dataset backed by PyArrow parquet.
 
     Returns items compatible with MultiHorizonTransformer:
         - past_feats: torch.Tensor shaped [L, F_p]
@@ -24,23 +23,23 @@ class SlidingWindowDataset(Dataset):
         context_len: Historical context length (L).
         max_horizon: Prediction horizon length (H).
         target_horizons: List of target horizons to predict (optional).
-        stride: Stride between windows.
         past_feature_indices: List of column indices or names to use as past features.
         future_feature_indices: List of column indices or names to use as future (known) features.
+        stride: Stride between windows.
         static_feature_indices: List of column indices or names to use as static features (optional).
         target: Column name, column index, or list of names/indices for target(s).
     """
     def __init__(
         self,
         parquet_path: str,
-        context_len: int = 120,
-        max_horizon: int = 15,
-        target_horizons: Optional[List[int]] = None,
-        stride: int = 15,
-        past_feature_indices: Optional[List[Union[int, str]]] = None,
-        future_feature_indices: Optional[List[Union[int, str]]] = None,
+        context_len: int,
+        max_horizon: int,
+        target_horizons: List[int],
+        past_feature_indices: Optional[List[Union[int, str]]],
+        future_feature_indices: Optional[List[Union[int, str]]],
+        stride: int = 1,
         static_feature_indices: Optional[List[Union[int, str]]] = None,
-        target: Union[int, str, List[Union[int, str]]] = 3
+        target: Union[int, str, List[Union[int, str]]] = -1,
     ):
         self.context_len = context_len
         self.max_horizon = max_horizon
@@ -49,7 +48,8 @@ class SlidingWindowDataset(Dataset):
 
         files = sorted([os.path.join(parquet_path, f) for f in os.listdir(parquet_path) if f.endswith(".parquet")])
         tables = [pq.read_table(f) for f in files]
-        self.table = pa.concat_tables(tables)
+        # self.table = pa.concat_tables(tables)
+        self.table = pa.Table.from_pandas(pa.concat_tables(tables).to_pandas().iloc[-1000:])
         self.total_rows = len(self.table)
 
         names = list(self.table.schema.names)
@@ -124,18 +124,16 @@ class SlidingWindowDataset(Dataset):
             for arr in self.future_arrays
         ]).astype(np.float32)
 
-        # target: handle single or multi-column targets
-        if len(self.target_arrays) == 1:
-            target = self.target_arrays[0][
-                future_start:future_start + self.max_horizon
-            ].astype(np.float32)
-            target_tensor = torch.from_numpy(target)
-        else:
-            target = np.column_stack([
-                arr[future_start:future_start + self.max_horizon]
-                for arr in self.target_arrays
-            ]).astype(np.float32)
-            target_tensor = torch.from_numpy(target)
+        if self.target_horizons is None:
+            raise ValueError("target_horizons must be provided for per-column-per-horizon mode")
+        if len(self.target_arrays) != len(self.target_horizons):
+            raise ValueError("When using per-column-per-horizon mode, number of target columns must equal number of target_horizons")
+        horizons = self.target_horizons.tolist()
+        target = np.array([
+            arr[future_start + int(h)]
+            for arr, h in zip(self.target_arrays, horizons)
+        ], dtype=np.float32)
+        target_tensor = torch.from_numpy(target)
 
         if self.static_arrays is not None:
             static_feats = np.array([
@@ -152,6 +150,4 @@ class SlidingWindowDataset(Dataset):
         if static_tensor is not None:
             inputs.append(static_tensor)
 
-        if self.target_horizons is not None:
-            target_tensor = target_tensor[self.target_horizons]
         return inputs, target_tensor

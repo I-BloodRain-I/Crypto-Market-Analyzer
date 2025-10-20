@@ -2,7 +2,7 @@
 
 This module provides lightweight helpers used during model training:
 
-- MetricsEvaluator: Wraps torchmetrics metric objects and accumulates metric
+- MetricsCollection: Wraps torchmetrics metric objects and accumulates metric
   state and loss across multiple batches.
 - EarlyStopping: Monitors a single metric and signals when training should stop
   after a configurable patience without improvement.
@@ -11,12 +11,14 @@ This module provides lightweight helpers used during model training:
 
 Example:
     trainer = Trainer(model, optimizer, loss_fn, device)
-    trainer.train(num_epochs, train_loader, val_loader, metrics=[...])
+    trainer.train(num_epochs, train_loader, val_loader, metrics={...})
 """
 
+import os
 import logging
+from pathlib import Path
 from copy import deepcopy
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -25,78 +27,99 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
 from torchmetrics import Accuracy, Precision, Recall, F1Score
+from tqdm.auto import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-class MetricsEvaluator:
+class MetricsCollection:
     """Collects and computes evaluation metrics and aggregated loss for a model over multiple batches.
 
-    This evaluator wraps a list of torchmetrics metric objects and accumulates their
+    This collector wraps a list of torchmetrics metric objects and accumulates their
     state across calls to ``step``. It also accumulates the scalar loss value so that
     the average or total loss can be reported alongside computed metrics.
     """
 
-    def __init__(self, metrics: List[F1Score], device: torch.device):
-        """Create a MetricsEvaluator.
+    def __init__(self, metrics: Dict[str, F1Score], device: torch.device, log_folder: Optional[str] = None):
+        """Create a MetricsCollection.
 
         Args:
-            metrics: Iterable of instantiated torchmetrics metric objects.
+            metrics: A dictionary mapping metric names to instantiated torchmetrics metric objects.
             device: Device to move metric states and computations to.
         """
         self._device = device
-        self._metrics = {metric.__class__.__name__: metric.to(device) for metric in deepcopy(metrics)}
-        self._loss = 0.0
-        self._cache = {}
-        self._computed = False
+        self._metrics = {name: metric.to(device) for name, metric in deepcopy(metrics).items()}
+        self._memory: Dict[str, List[float]] = self._init_memory()
+        self._temp_memory: Dict[str, List[float]] = self._init_memory()
+        self._steps: int = 0
 
-    def compute_metrics(self) -> Dict[str, Any]:
+    def _init_memory(self) -> Dict[str, List[float]]:
+        memory = {name: [] for name in self._metrics.keys()}
+        memory["loss"] = []
+        return memory
+
+    def compute_metrics(self) -> Dict[str, float]:
         """Compute and return all metrics and the accumulated loss.
-
-        The computed results are cached so repeated calls return the cached values
-        until a state-changing method (for example, ``step`` or ``reset``) is invoked.
 
         Returns:
             A dictionary mapping metric names to scalar values and including the key
             ``"loss"`` for the current accumulated loss.
         """
-        if self._computed:
-            return self._cache
-        results = {name: metric.compute().item() for name, metric in self._metrics.items()}
-        results["loss"] = self._loss
-        self._computed = True
-        self._cache = deepcopy(results)
-        return results
+        result = {}
+        for name, steps in self._temp_memory.items():
+            if name == "loss":
+                result["loss"] = sum(steps) / self._steps
+            else:
+                final_val = self._metrics[name].compute()
+                result[name] = float(final_val.item())
+        return result
 
-    def step(self, outputs: torch.Tensor, targets: torch.Tensor, loss: torch.Tensor):
+    def step(self, outputs: torch.Tensor, targets: torch.Tensor, loss: torch.Tensor) -> Dict[str, float]:
         """Update internal metric state with a new batch and accumulate loss.
 
         Args:
             outputs: Model outputs for the current batch.
             targets: Ground-truth targets for the current batch.
             loss: Computed loss tensor for the current batch; its scalar value will be accumulated.
-        """
-        for metric in self._metrics.values():
-            metric.update(outputs, targets)
-        self._loss += loss.item()
-        self._computed = False
-        self._cache.clear()
-    
-    def reset(self):
-        """Reset all metric states and the accumulated loss.
 
-        After calling this method the evaluator behaves as if no batches have been
-        seen; computed results will be recomputed on the next call to
-        ``compute_metrics``.
+        Returns:
+            A dictionary mapping metric names to their computed values for the current batch,
+            including the key ``"loss"`` for the current batch loss.
         """
+        result = {}
+        for name, metric in self._metrics.items():
+            val = float(metric(outputs, targets).item())
+            self._temp_memory[name].append(val)
+            self._memory[name].append(val)
+            result[name] = val
+
+        loss_ = float(loss.item())
+        self._temp_memory["loss"].append(loss_)
+        self._memory["loss"].append(loss_)
+        result["loss"] = loss_
+
+        self._steps += 1
+        return result
+
+    def reset(self) -> None:
+        """Reset recorded per-step history and cached computations."""
         for metric in self._metrics.values():
             metric.reset()
-        self._loss = 0.0
-        self._computed = False
-        self._cache.clear()
+        self._temp_memory = self._init_memory()
+        self._steps = 0
 
-    def format_metrics_to_log(self) -> str:
+    def get_step_records(self, step: int) -> Dict[str, float]:
+        """Return recorded metric/loss values for a specific step index."""
+        if step >= self._steps:
+            raise IndexError(f"Step index {step} is out of bounds for recorded steps ({-self._steps} to {self._steps - 1})")
+        return {name: self._temp_memory[name][step] for name in self._temp_memory.keys()}
+
+    def get_all_saved_records(self) -> Dict[str, List[float]]:
+        """Return all persisted recorded metric/loss values across resets."""
+        return self._memory
+
+    def format_metrics_to_string(self) -> str:
         """Format computed metrics into a human-readable single-line string for logging.
 
         The formatting produces ``name: value`` pairs separated by ``|`` and rounds
@@ -108,7 +131,8 @@ class MetricsEvaluator:
         """
         metrics = self.compute_metrics()
         metrics_log = ""
-        for key, value in metrics.items():
+        for key in sorted(metrics.keys()):
+            value = metrics[key]
             if isinstance(value, (list, tuple)):
                 metrics_log += f"{key}: " + ", ".join([f"{v:.4f}" for v in value]) + " | "
             else:
@@ -180,6 +204,11 @@ class Trainer:
     convenience ``train`` method that runs training and validation loops, logs
     progress, and optionally evaluates on a held-out test set.
     """
+
+    PROJECT_ROOT = Path(__file__).resolve().parents[2]
+    TENSORBOARD_FOLDER = PROJECT_ROOT / "runs"
+    TENSORBOARD_FOLDER.mkdir(parents=True, exist_ok=True)
+
     def __init__(
         self,
         model: nn.Module,
@@ -187,7 +216,8 @@ class Trainer:
         loss_fn: nn.Module,
         device: torch.device,
         use_amp: bool = False,
-        log_dir: Optional[str] = None,
+        enable_tensorboard: bool = True,
+        experiment_name: Optional[str] = None,
         writer: Optional[SummaryWriter] = None,
     ):
         """Create a Trainer instance.
@@ -198,8 +228,8 @@ class Trainer:
             loss_fn: Loss function used to compute gradients during training.
             device: Device where model and data tensors will be placed.
             use_amp: Whether to enable automatic mixed precision (requires CUDA).
-            log_dir: Optional path to a TensorBoard log directory. If provided and
-                ``writer`` is not supplied, a SummaryWriter will be created.
+            enable_tensorboard: Whether to enable TensorBoard logging. If False, no SummaryWriter will be created.
+            experiment_name: Optional name for the TensorBoard experiment. If not provided, a default name will be generated.
             writer: Optional externally-created SummaryWriter instance to use.
         """
         self.model = model.to(device)
@@ -217,64 +247,52 @@ class Trainer:
         self.use_amp = use_amp
         self.scaler = GradScaler() if self.use_amp else None
 
-        # TensorBoard writer handling
-        self.writer = writer if writer is not None else (SummaryWriter(log_dir) if log_dir is not None else None)
-        self._owns_writer = (writer is None) and (log_dir is not None)
+        if not experiment_name:
+            files = os.listdir(self.TENSORBOARD_FOLDER)
+            experiment_name = f"experiment_{len(files) + 1}"
 
-    def _log_model_graph(self, data_loader: Optional[DataLoader] = None, example_input: Optional[Any] = None) -> None:
+        # TensorBoard writer handling
+        if enable_tensorboard:
+            self.writer = writer if writer is not None else SummaryWriter(str(self.TENSORBOARD_FOLDER / experiment_name))
+        else:
+            self.writer = None
+
+    def _log_model_graph(self, data_loader: Optional[DataLoader] = None) -> None:
         """Log the model graph to TensorBoard using an example input.
 
-        The method attempts to use ``example_input`` if provided; otherwise it will
-        try to pull a single batch from ``data_loader``. Handles single-tensor
-        inputs as well as list/tuple inputs (for models accepting multiple inputs).
-
         Args:
-            data_loader: DataLoader to draw a single batch from when ``example_input`` is not provided.
-            example_input: Optional example input compatible with the model. Can be a
-                tensor, tuple, list or other object the model accepts.
+            data_loader: DataLoader to draw a single batch from
         """
         if self.writer is None:
             return
 
-        inp = example_input
-        if inp is None and data_loader is not None:
-            try:
-                batch = next(iter(data_loader))
-            except Exception as e:
-                logger.warning(f"Unable to fetch a batch from DataLoader to log model graph: {e}")
-                return
-            # Expecting (x_batch, y_batch) tuples from the DataLoader
-            if isinstance(batch, (list, tuple)) and len(batch) >= 1:
-                inp = batch[0]
-            else:
-                inp = batch
+        batch = next(iter(data_loader))
+        if isinstance(batch, (list, tuple)) and len(batch) >= 1:
+            inp = batch[0]
+        else:
+            inp = batch
 
-        if inp is None:
-            logger.warning("No example input available to log model graph")
-            return
+        inp = self._to_device(inp)
+        if isinstance(inp, torch.Tensor):
+            inp = (inp, )
 
         try:
-            if isinstance(inp, (list, tuple)):
-                prepared = []
-                for x in inp:
-                    if isinstance(x, torch.Tensor):
-                        prepared.append(x.to(self.device))
-                    else:
-                        prepared.append(x)
-                prepared_inp = tuple(prepared)
-            elif isinstance(inp, torch.Tensor):
-                prepared_inp = inp.to(self.device)
-            else:
-                prepared_inp = inp
+            self.model.eval()
+            with torch.no_grad():
+                class WrappedModel(torch.nn.Module):
+                    def __init__(self, model):
+                        super().__init__()
+                        self.model = model
+                    def forward(self, *args):
+                        return self.model(*args)
 
-            try:
-                self.writer.add_graph(self.model, prepared_inp)
+                wrapped = WrappedModel(self.model)
+
+                self.writer.add_graph(wrapped, inp)
                 self.writer.flush()
                 logger.info("Model graph written to TensorBoard")
-            except Exception as e:
-                logger.warning(f"Failed to write model graph to TensorBoard: {e}")
         except Exception as e:
-            logger.warning(f"Error preparing example input for model graph: {e}")
+            logger.warning(f"Failed to write model graph to TensorBoard: {e}")
 
     def train(
         self, 
@@ -282,10 +300,9 @@ class Trainer:
         train_loader: DataLoader, 
         val_loader: DataLoader,
         test_loader: Optional[DataLoader] = None,
-        metrics: List[Any] = [],
+        metrics: Dict[str, Any] = {},
         early_stopping: Optional[Dict[str, Any]] = None,
-        log_graph: bool = False,
-        example_input: Optional[Any] = None,
+        log_graph: bool = False
     ):
         """Run the training loop with validation, logging and optional early stopping.
 
@@ -294,40 +311,44 @@ class Trainer:
             train_loader: DataLoader that yields training batches.
             val_loader: DataLoader used to evaluate validation performance after each epoch.
             test_loader: Optional DataLoader for a final test evaluation after training.
-            metrics: List of torchmetrics metric instances to evaluate during training and validation.
+            metrics: Dict of name with torchmetrics metric instances to evaluate during training and validation.
             early_stopping: Optional mapping used to construct an EarlyStopping instance
                 (e.g. {"monitor": "loss", "patience": 3}). If omitted, early stopping is disabled.
             log_graph: Optional flag to log the model graph to TensorBoard once before training.
-            example_input: Optional example input for logging the model graph. Overrides
-                ``log_graph`` if provided.
+
+        Returns:
+            A dictionary with training, validation and test metrics records.
         """
-        train_metrics_eval = MetricsEvaluator(metrics, self.device)
-        val_metrics_eval = MetricsEvaluator(metrics, self.device)
+        train_metrics = MetricsCollection(metrics, self.device)
+        val_metrics = MetricsCollection(metrics, self.device)
 
         stopper = EarlyStopping(**early_stopping) if early_stopping else None
 
         # Optionally log the model graph once before training
         if log_graph and self.writer is not None:
-            self._log_model_graph(data_loader=train_loader, example_input=example_input)
+            self._log_model_graph(data_loader=train_loader)
         
         for epoch in range(num_epochs):
-            self._train(train_loader, train_metrics_eval)
-            self._test(val_loader, val_metrics_eval)
-            self.log(epoch, train_metrics_eval, val_metrics_eval)
+            train_metrics.reset()
+            val_metrics.reset()
+
+            self._train(train_loader, train_metrics)
+            self._test(val_loader, val_metrics)
+            self.log(epoch, train_metrics, val_metrics)
 
             # Write metrics to TensorBoard
             if self.writer is not None:
-                train_results = train_metrics_eval.compute_metrics()
-                val_results = val_metrics_eval.compute_metrics()
+                train_results = train_metrics.compute_metrics()
+                val_results = val_metrics.compute_metrics()
                 step = epoch + 1
                 for key, val in train_results.items():
-                    self.writer.add_scalar(f"train/{key}", float(val), step)
+                    self.writer.add_scalar(f"train/{key}", val, step)
                 for key, val in val_results.items():
-                    self.writer.add_scalar(f"val/{key}", float(val), step)
+                    self.writer.add_scalar(f"val/{key}", val, step)
 
             # Early stopping check
             if stopper:
-                val_results = val_metrics_eval.compute_metrics()
+                val_results = val_metrics.compute_metrics()
                 monitor_value = val_results.get(stopper.monitor)
                 if monitor_value is None:
                     logger.warning(f"EarlyStopping monitor '{stopper.monitor}' not found in validation results; skipping early-stopping check")
@@ -341,25 +362,39 @@ class Trainer:
                             logger.info(f"Early stopping triggered (no improvement in '{stopper.monitor}' for {stopper.patience} epochs)")
                             break
 
-            train_metrics_eval.reset()
-            val_metrics_eval.reset()
-
+        test_metrics = None
         if test_loader:
-            test_metrics_eval = MetricsEvaluator(metrics, self.device)
-            self._test(test_loader, test_metrics_eval)
-            logger.info(f"Test Metrics: {test_metrics_eval.format_metrics_to_log()}")
+            test_metrics = MetricsCollection(metrics, self.device)
+            self._test(test_loader, test_metrics)
+            logger.info(f"Test Metrics: {test_metrics.format_metrics_to_string()}")
 
             if self.writer is not None:
-                test_results = test_metrics_eval.compute_metrics()
+                test_results = test_metrics.compute_metrics()
                 step = num_epochs
                 for key, val in test_results.items():
-                    self.writer.add_scalar(f"test/{key}", float(val), step)
+                    self.writer.add_scalar(f"test/{key}", val, step)
 
-        if self.writer is not None and self._owns_writer:
+        if self.writer is not None:
             self.writer.flush()
             self.writer.close()
 
-    def _train(self, train_loader: DataLoader, metrics_eval: MetricsEvaluator) -> None:
+        def _create_output_dict(mc: MetricsCollection) -> Dict[str, List[float]]:
+            result = {}
+            metrics = mc.compute_metrics()
+            for name, vals in mc.get_all_saved_records().items():
+                result[name] = {
+                    "steps": vals,
+                    "final": metrics[name]
+                }
+            return result
+
+        return {
+            "train": _create_output_dict(train_metrics),
+            "val": _create_output_dict(val_metrics),
+            "test": _create_output_dict(test_metrics) if test_metrics else None
+        }
+
+    def _train(self, train_loader: DataLoader, metrics: MetricsCollection) -> None:
         """Perform a single training epoch over the provided DataLoader.
 
         Args:
@@ -367,12 +402,9 @@ class Trainer:
             metrics_eval: MetricsEvaluator instance used to update and accumulate metrics.
         """
         self.model.train()
-        for x_batch, y_batch in train_loader:
-            if isinstance(x_batch, (list, tuple)):
-                x_batch = [x.to(self.device, non_blocking=True) for x in x_batch]
-            else:
-                x_batch = x_batch.to(self.device, non_blocking=True)
-            y_batch = y_batch.to(self.device, non_blocking=True)
+        for batch in tqdm(train_loader, desc="Train", unit="batch", total=len(train_loader)):
+            x_batch = self._to_device(batch[0])
+            y_batch = self._to_device(batch[1])
 
             self.optimizer.zero_grad()
 
@@ -384,7 +416,7 @@ class Trainer:
                         outputs = self.model(x_batch)
                     loss = self.loss_fn(outputs.squeeze(-1), y_batch)
                 self.scaler.scale(loss).backward()
-                metrics_eval.step(outputs.squeeze(-1), y_batch, loss)
+                metrics.step(outputs.squeeze(-1), y_batch, loss)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
@@ -394,10 +426,10 @@ class Trainer:
                     outputs = self.model(x_batch)
                 loss = self.loss_fn(outputs.squeeze(-1), y_batch)
                 loss.backward()
-                metrics_eval.step(outputs.squeeze(-1), y_batch, loss)
+                metrics.step(outputs.squeeze(-1), y_batch, loss)
                 self.optimizer.step()
 
-    def _test(self, test_loader: DataLoader, metrics_eval: MetricsEvaluator) -> None:
+    def _test(self, test_loader: DataLoader, metrics: MetricsCollection) -> None:
         """Evaluate the model on data from ``test_loader`` without updating parameters.
 
         Args:
@@ -406,29 +438,36 @@ class Trainer:
         """
         self.model.eval()
         with torch.no_grad():
-            for x_batch, y_batch in test_loader:
-                x_batch = x_batch.to(self.device, non_blocking=True)
-                y_batch = y_batch.to(self.device, non_blocking=True)
+            for batch in tqdm(test_loader, desc="Test", unit="batch", total=len(test_loader)):
+                x_batch = self._to_device(batch[0])
+                y_batch = self._to_device(batch[1])
                 if self.use_amp:
                     with autocast():
                         if isinstance(x_batch, list):
                             outputs = self.model(*x_batch)
                         else:
                             outputs = self.model(x_batch)
-                        loss = self.loss_fn(outputs.squeeze(-1), y_batch)
+                        outputs = outputs.squeeze(-1)
+                        loss = self.loss_fn(outputs, y_batch)
                 else:
                     if isinstance(x_batch, list):
                         outputs = self.model(*x_batch)
                     else:
                         outputs = self.model(x_batch)
-                    loss = self.loss_fn(outputs.squeeze(-1), y_batch)
-                metrics_eval.step(outputs, y_batch, loss)
+                    outputs = outputs.squeeze(-1)
+                    loss = self.loss_fn(outputs, y_batch)
+                metrics.step(outputs, y_batch, loss)
+
+    def _to_device(self, batch: Union[List[torch.Tensor], torch.Tensor]) -> Union[List[torch.Tensor], torch.Tensor]:
+        if isinstance(batch, list):
+            return [x.to(self.device, non_blocking=True) for x in batch]
+        return batch.to(self.device, non_blocking=True)
 
     def log(
         self, 
         epoch: int, 
-        train_metrics_eval: MetricsEvaluator,
-        val_metrics_eval: MetricsEvaluator
+        train_metrics_eval: MetricsCollection,
+        val_metrics_eval: MetricsCollection
     ) -> None:
         """Log training and validation metrics for the given epoch.
 
@@ -438,8 +477,8 @@ class Trainer:
             val_metrics_eval: MetricsEvaluator with accumulated validation metrics.
         """
         log_msg = f"Epoch {epoch+1}:\n"
-        log_msg += f"Train Metrics: {train_metrics_eval.format_metrics_to_log()}\n"
-        log_msg += f"Val Metrics:   {val_metrics_eval.format_metrics_to_log()}\n"
+        log_msg += f"Train Metrics: {train_metrics_eval.format_metrics_to_string()}\n"
+        log_msg += f"Val Metrics:   {val_metrics_eval.format_metrics_to_string()}\n"
         logger.info(log_msg)
 
 
@@ -453,7 +492,7 @@ if __name__ == "__main__":
     loss_fn = nn.CrossEntropyLoss()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    metrics = MetricsEvaluator(
+    metrics = MetricsCollection(
         metrics=[
             Accuracy(task="multiclass", num_classes=2), 
             Precision(task="multiclass", num_classes=2), 

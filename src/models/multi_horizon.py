@@ -580,9 +580,9 @@ class MultiHorizonTransformer(nn.Module):
         cfg = self.cfg
         B, L, Fp = past_feats.shape
         B2, H, Ff = future_feats.shape
-        assert B == B2 and L == cfg.context_len and H == cfg.max_horizon, "Invalid shapes for past/future."
+        assert B == B2 and L == cfg.context_len and H == cfg.max_horizon, f"Invalid shapes for past/future. Expected B={B}, L={cfg.context_len}, H={cfg.max_horizon}."
         if static_feats is not None:
-            assert static_feats.shape[0] == B and static_feats.shape[1] == cfg.static_feat_dim, "Invalid static shape."
+            assert static_feats.shape[0] == B and static_feats.shape[1] == cfg.static_feat_dim, f"Invalid static shape. Expected B={B}, F_s={cfg.static_feat_dim}."
         assert (not cfg.use_quantiles and cfg.out_dim == 1) or \
             (cfg.use_quantiles and cfg.out_dim == len(cfg.quantiles)), \
             "Mismatch: set out_dim=1 for point forecast, or out_dim=len(quantiles) with use_quantiles=True."

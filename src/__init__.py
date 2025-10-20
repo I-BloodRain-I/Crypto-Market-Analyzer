@@ -1,1 +1,1 @@
-from .train import Trainer
+from .training import Trainer, DataPipelineForTraining

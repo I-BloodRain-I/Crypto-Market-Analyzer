@@ -8,6 +8,7 @@ value detection.
 """
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -32,7 +33,16 @@ class DataProcessor:
     building a pipeline from a configuration, transforming a DataFrame with a
     fitted pipeline, splitting the DataFrame into train/test (and optional
     validation) sets or validating data quality.
+
+    Constants:
+		PROJECT_ROOT: Path to the project root inferred from this file's location.
+		DATA_FOLDER: Top-level data directory inside the project.
+		PROCESSED_FOLDER: Folder containing processed data.
     """
+
+    PROJECT_ROOT = Path(__file__).resolve().parents[2]
+    DATA_FOLDER = PROJECT_ROOT / "data"
+    PROCESSED_FOLDER = DATA_FOLDER / "processed"
 
     @staticmethod
     def process_data(df: pd.DataFrame, pipeline: Pipeline) -> pd.DataFrame:
