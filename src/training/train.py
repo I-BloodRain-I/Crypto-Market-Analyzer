@@ -197,6 +197,7 @@ class EarlyStopping:
             return self.num_bad_epochs >= self.patience
 
 
+# warmup, cosine annealing
 class Trainer:
     """High-level training orchestrator that handles epochs, evaluation and optional early stopping.
 

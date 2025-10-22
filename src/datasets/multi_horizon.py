@@ -132,7 +132,7 @@ class MultiHorizonDataset(Dataset):
         target = np.array([
             arr[future_start + int(h)]
             for arr, h in zip(self.target_arrays, horizons)
-        ], dtype=np.float32)
+        ], dtype=np.int64)
         target_tensor = torch.from_numpy(target)
 
         if self.static_arrays is not None:

@@ -4,11 +4,11 @@ This module provides PipelineBuilder which constructs a ColumnTransformer-based
 preprocessing pipeline from a PipelineConfig instance.
 """
 
-from typing import Literal
+from typing import Any, Dict, List, Literal, Tuple
 
-from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import FunctionTransformer, Pipeline
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, OneHotEncoder
 
 from .config import DataPipelineConfig, FeatureScalingConfig
@@ -52,6 +52,14 @@ class PipelineBuilder:
         if config.binary and config.binary.features:
             bin_pipeline = cls._create_binary_pipeline(config.binary, config.handle_unknown)
             transformers.append(("bin", bin_pipeline, config.binary.features))
+
+        if config.lambda_func:
+            lambda_pipeline = cls._create_lambda_pipeline(config.lambda_func)
+            transformers.append(("lambda", lambda_pipeline, list(config.lambda_func.keys())))
+        
+        if config.custom_transformers:
+            custom_pipeline = cls._create_custom_transformer_pipeline(config.custom_transformers)
+            transformers.append(("custom", custom_pipeline, list(config.custom_transformers.keys())))
 
         column_transformer = ColumnTransformer(transformers=transformers, remainder=config.remainder)
         pipeline = Pipeline(steps=[("preprocessor", column_transformer)])
@@ -134,4 +142,46 @@ class PipelineBuilder:
         encoder = OneHotEncoder(handle_unknown=handle_unknown, drop="if_binary", sparse_output=False)
         steps.append(("encoder", encoder))
 
+        return Pipeline(steps=steps)
+    
+    @staticmethod
+    def _create_lambda_pipeline(lambda_funcs: Dict[str, str]) -> Pipeline:
+        """Create a pipeline that applies lambda functions to features.
+
+        Args:
+            lambda_funcs: Dictionary mapping feature names to lambda function strings
+
+        Returns:
+            A sklearn Pipeline that applies the lambda functions
+        """
+        steps: List[Tuple[str, FunctionTransformer]] = []
+        for name, expr in lambda_funcs.items():
+            fn = eval(expr) if isinstance(expr, str) else expr
+            if not callable(fn):
+                raise TypeError(f"Lambda spec must be callable or valid lambda string, got: {type(fn)}")
+            steps.append((name, FunctionTransformer(func=fn, validate=False)))
+        return Pipeline(steps=steps)
+    
+    @staticmethod
+    def _create_custom_transformer_pipeline(custom_transformers: Dict[str, Dict[str, str]]) -> Pipeline:
+        """Create a pipeline that applies custom transformers to features.
+
+        Args:
+            custom_transformers: Dictionary mapping feature names to transformer specs
+
+        Returns:
+            A sklearn Pipeline that applies the custom transformers
+        """
+        steps: List[Tuple[str, Any]] = []
+        for name, spec in custom_transformers.items():
+            transformer_type = spec.get("type")
+            params = spec.get("params", {})
+            if transformer_type == "function":
+                fn = eval(params["function"]) if isinstance(params["function"], str) else params["function"]
+                if not callable(fn):
+                    raise TypeError(f"Custom transformer function must be callable or valid string, got: {type(fn)}")
+                transformer = FunctionTransformer(func=fn, validate=False)
+            else:
+                raise ValueError(f"Unsupported custom transformer type: {transformer_type}")
+            steps.append((name, transformer))
         return Pipeline(steps=steps)

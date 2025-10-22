@@ -15,10 +15,10 @@ Example:
 """
 
 import json
+import importlib
 from pathlib import Path
-from typing import List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
-import pandas as pd
 from pydantic import BaseModel
 
 
@@ -56,6 +56,8 @@ class DataPipelineConfig(BaseModel):
         numerical_minmax: Configuration for features that should be min-max scaled.
         categorical: Configuration for categorical features (imputation/encoding).
         binary: Configuration for binary features.
+        lambda_func: Mapping of feature names to lambda functions for custom transformations.
+        custom_transformers: Mapping of feature names to custom transformer instances.
         handle_unknown: How to handle unknown categories encountered at transform time.
         rolling_window: Optional rolling window size to apply rolling mean on numeric features before scaling.
         remainder: What to do with columns not targeted by any transformer (drop or passthrough).
@@ -65,6 +67,8 @@ class DataPipelineConfig(BaseModel):
     numerical_minmax: Optional[FeatureScalingConfig] = None
     categorical: Optional[FeatureScalingConfig] = None
     binary: Optional[FeatureScalingConfig] = None
+    lambda_func: Optional[Dict[str, str]] = None
+    custom_transformers: Optional[Dict[str, object]] = None
     handle_unknown: Literal["ignore", "error"] = "ignore"
     rolling_window: Optional[int] = None  # If set, apply rolling mean with this window size
     remainder: Literal["drop", "passthrough"] = "passthrough"
@@ -93,6 +97,14 @@ class DataPipelineConfig(BaseModel):
         with open(path) as f:
             loaded_json = json.load(f)
 
+        custom_transformers_json = loaded_json["custom_transformers"]
+        custom_transformers = {}
+        if custom_transformers:
+            module = importlib.import_module("src.data.transformers")
+            for key, transformer_str in custom_transformers_json.items():
+                cls = getattr(module, transformer_str)
+                custom_transformers[key] = cls()
+
         return DataPipelineConfig(
             numerical_std=FeatureScalingConfig(
                 **loaded_json["numerical_std"]
@@ -108,7 +120,12 @@ class DataPipelineConfig(BaseModel):
             ) if loaded_json["categorical"] else None,
             binary=FeatureScalingConfig(
                 **loaded_json["binary"]
-            ) if loaded_json["binary"] else None
+            ) if loaded_json["binary"] else None,
+            lambda_func=loaded_json["lambda_func"],
+            custom_transformers=custom_transformers if custom_transformers else None,
+            handle_unknown=loaded_json["handle_unknown"],
+            rolling_window=loaded_json["rolling_window"],
+            remainder=loaded_json["remainder"]
         )
     
     def save(self, path: Union[str, Path]) -> None:
@@ -124,7 +141,11 @@ class DataPipelineConfig(BaseModel):
             path = Path(path)
         if path.suffix != ".json":
             raise ValueError(f"Config file must be a JSON file: {path}")
-        
+
+        model_json = self.model_dump()
+        if self.custom_transformers:
+            model_json["custom_transformers"] = {key: str(transformer) for key, transformer in self.custom_transformers.items()}
+
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
-            json.dump(self.model_dump(), f, indent=4)
+            json.dump(model_json, f, indent=4)

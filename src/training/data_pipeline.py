@@ -7,8 +7,8 @@ import pandas as pd
 from sklearn.pipeline import Pipeline
 pd.options.mode.copy_on_write = True
 
-from src.data import DataExtractor, DataProcessor, DataPipelineConfig
-from src.utils import convert_timeframe_to_seconds
+from data import DataExtractor, DataProcessor, DataPipelineConfig
+from utils import convert_timeframe_to_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,20 @@ class DataPipelineForTraining:
         out = out.reset_index().rename(columns={"index": "timestamp"})
         out['timestamp'] = (out['timestamp'].view('int64') // 10**6).astype('int64')
         return out
+
+    def _duplicate_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
+        df_filled = df.drop(columns="create_time").ffill()
+        main_indices = df.drop(columns="create_time").dropna(how='all').index
+
+        last_main = pd.Series(np.nan, index=df.index)
+        last_main.loc[main_indices] = main_indices
+        last_main = last_main.ffill()
         
+        df_filled['distance'] = (df.index.to_numpy() - last_main.to_numpy()).astype('int')
+        df_filled["create_time"] = df["create_time"]
+
+        return df_filled
+
     def _combine_data_sources(self, symbol: str, timeframe: str = "1m") -> pd.DataFrame:
         book_depth_data = self._downgrade_dtype(self._resolve_raw_data(symbol, "bookDepth"))
         klines_data     = self._downgrade_dtype(self._resolve_raw_data(symbol, "klines"))
@@ -177,6 +190,7 @@ class DataPipelineForTraining:
         )
 
         metrics_data = self._extend_metrics_time(metrics_data, timeframe=timeframe)
+        metrics_data = self._duplicate_metrics(metrics_data)
         book_depth_data = self._transpose_book_depth(book_depth_data)
         book_depth_data = self._interpolate_book_depth(book_depth_data, timeframe=timeframe)
         gc.collect()
@@ -217,7 +231,7 @@ class DataPipelineForTraining:
         return processed_data
 
 if __name__ == "__main__":
-    from src.data import FeatureScalingConfig
+    from data import FeatureScalingConfig
     logging.basicConfig(level=logging.DEBUG)
     # cfg = DataPipelineConfig(
     #     numerical_std=FeatureScalingConfig(
@@ -227,10 +241,7 @@ if __name__ == "__main__":
     #     )
     # )
     pipeline = DataPipelineForTraining(None)
-    pipeline._combine_data_sources("BTCUSDT").iloc[-10_000:].to_csv("combined_data.csv", index=False)
-    # metrics = pipeline._resolve_raw_data("BTCUSDT", "metrics")
-    # metrics.pop("symbol")
-    # metrics_expanded = pipeline._extend_metrics_time(metrics, timeframe="1m")
-    # print(metrics.shape, metrics_expanded.shape)
-    # print(metrics.head(100))
-    # print(metrics_expanded.head(200))
+    print("ok")
+    exit(0)
+    df = pipeline._combine_data_sources("BTCUSDT")
+    df.iloc[-10_000:].to_csv("combined_data.csv", index=False)
