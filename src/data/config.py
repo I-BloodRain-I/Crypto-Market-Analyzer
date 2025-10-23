@@ -15,11 +15,41 @@ Example:
 """
 
 import json
+import inspect
 import importlib
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Union
+from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel
+
+
+class CustomTransformerConfig(BaseModel):
+    """Configuration for a custom transformer to be applied to a features.
+
+    This model encapsulates the specification of a custom transformer
+    instance to be applied to a named feature when building a preprocessing
+    pipeline.
+
+    Attributes:
+        features: The list of feature names this configuration applies to.
+        instance: The transformer instance to apply.
+    """
+    features: List[str]
+    instance: object
+
+
+class LambdaFunctionConfig(BaseModel):
+    """Configuration for applying a lambda function to a feature.
+
+    This model encapsulates the specification of a lambda function to be
+    applied to a named feature when building a preprocessing pipeline.
+
+    Attributes:
+        feature: The name of the feature this configuration applies to.
+        function: A string representation of the lambda function to apply.
+    """
+    feature: str
+    function: str
 
 
 class FeatureScalingConfig(BaseModel):
@@ -37,7 +67,7 @@ class FeatureScalingConfig(BaseModel):
         fill_value: Value used when `impute_strategy` is set to "constant".
     """
     features: List[str]
-    impute_strategy: Literal["mean", "median", "most_frequent", "constant"] = "median"
+    impute_strategy: Optional[Literal["mean", "median", "most_frequent", "constant"]] = None
     scaler: Literal["standard", "minmax", "robust", "none"] = "standard"
     fill_value: Union[int, float, str, None] = 0  # Used if strategy is "constant"
 
@@ -56,8 +86,8 @@ class DataPipelineConfig(BaseModel):
         numerical_minmax: Configuration for features that should be min-max scaled.
         categorical: Configuration for categorical features (imputation/encoding).
         binary: Configuration for binary features.
-        lambda_func: Mapping of feature names to lambda functions for custom transformations.
-        custom_transformers: Mapping of feature names to custom transformer instances.
+        lambda_func: List of lambda function configurations to apply to features.
+        custom_transformers: List of custom transformer configurations to apply to features.
         handle_unknown: How to handle unknown categories encountered at transform time.
         rolling_window: Optional rolling window size to apply rolling mean on numeric features before scaling.
         remainder: What to do with columns not targeted by any transformer (drop or passthrough).
@@ -67,8 +97,8 @@ class DataPipelineConfig(BaseModel):
     numerical_minmax: Optional[FeatureScalingConfig] = None
     categorical: Optional[FeatureScalingConfig] = None
     binary: Optional[FeatureScalingConfig] = None
-    lambda_func: Optional[Dict[str, str]] = None
-    custom_transformers: Optional[Dict[str, object]] = None
+    lambda_funcs: Optional[List[LambdaFunctionConfig]] = None
+    custom_transformers: Optional[List[CustomTransformerConfig]] = None
     handle_unknown: Literal["ignore", "error"] = "ignore"
     rolling_window: Optional[int] = None  # If set, apply rolling mean with this window size
     remainder: Literal["drop", "passthrough"] = "passthrough"
@@ -97,13 +127,19 @@ class DataPipelineConfig(BaseModel):
         with open(path) as f:
             loaded_json = json.load(f)
 
-        custom_transformers_json = loaded_json["custom_transformers"]
-        custom_transformers = {}
-        if custom_transformers:
-            module = importlib.import_module("src.data.transformers")
-            for key, transformer_str in custom_transformers_json.items():
-                cls = getattr(module, transformer_str)
-                custom_transformers[key] = cls()
+        custom_transformers = []
+        if loaded_json["custom_transformers"]:
+            for cfg in loaded_json["custom_transformers"]:
+                custom_transformers.append(
+                    CustomTransformerConfig(
+                        features=cfg["features"],
+                        instance=getattr(
+                            importlib.import_module(cfg["instance"].rsplit(".", 1)[0]),
+                            cfg["instance"].rsplit(".", 1)[1]
+                        )(**cfg["params"])
+                    )
+                )
+                
 
         return DataPipelineConfig(
             numerical_std=FeatureScalingConfig(
@@ -121,7 +157,11 @@ class DataPipelineConfig(BaseModel):
             binary=FeatureScalingConfig(
                 **loaded_json["binary"]
             ) if loaded_json["binary"] else None,
-            lambda_func=loaded_json["lambda_func"],
+            lambda_funcs=[
+                LambdaFunctionConfig(**cfg) 
+                for cfg in loaded_json["lambda_funcs"]
+            ] 
+            if loaded_json["lambda_funcs"] else None,
             custom_transformers=custom_transformers if custom_transformers else None,
             handle_unknown=loaded_json["handle_unknown"],
             rolling_window=loaded_json["rolling_window"],
@@ -144,7 +184,17 @@ class DataPipelineConfig(BaseModel):
 
         model_json = self.model_dump()
         if self.custom_transformers:
-            model_json["custom_transformers"] = {key: str(transformer) for key, transformer in self.custom_transformers.items()}
+            model_json["custom_transformers"] = [
+                {
+                    "features": transformer.features, 
+                    "instance": transformer.instance.__class__.__name__, 
+                    "params": {
+                        p: getattr(transformer.instance, p) 
+                        for p in list(inspect.signature(transformer.instance.__init__).parameters.keys())
+                    }
+                } 
+                for transformer in self.custom_transformers
+            ]
 
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:

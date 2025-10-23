@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, TensorDataset, Sampler, Dataset
 
 from .config import DataPipelineConfig
 from .pipeline_builder import PipelineBuilder
+from .label_generator import LabelGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ class DataProcessor:
     PROCESSED_FOLDER = DATA_FOLDER / "processed"
 
     @staticmethod
-    def process_data(df: pd.DataFrame, pipeline: Pipeline) -> pd.DataFrame:
+    def process_data(df: pd.DataFrame, pipeline: Pipeline, timeframe: str = "1m") -> pd.DataFrame:
         """Transform a DataFrame using a fitted preprocessing pipeline.
 
         The pipeline must be fitted before calling this function. The returned
@@ -54,6 +55,7 @@ class DataProcessor:
         Args:
             df: The input DataFrame to transform.
             pipeline: A fitted sklearn Pipeline or ColumnTransformer.
+            timeframe: The time frame for the data (default is "1m").
 
         Returns:
             A DataFrame containing the transformed features.
@@ -128,6 +130,84 @@ class DataProcessor:
             A sklearn Pipeline instance constructed according to the configuration.
         """
         return PipelineBuilder.build(config)
+
+    @staticmethod
+    def label_data(
+        df: pd.DataFrame,
+        horizons: List[int],
+        *,
+        alpha: float = 1.0,
+        k_imb: float = 0.3,
+        k_liq: float = 0.2,
+        gamma_strong: float = 2.0,
+        span_sig: int = 100,
+        band_cols: Tuple[int, ...] = (1, 2, 3, 4, 5),
+        floor_bp: float = 2e-4,
+        roll_liq: int = 200
+    ) -> pd.DataFrame:
+        """Generate multi-horizon labels and sample weights and attach them to the DataFrame.
+
+        This method builds a LabelGenerator with the provided parameters and
+        uses it to compute horizon labels and sample weights from the
+        DataFrame's 'close' column and depth columns (any columns starting
+        with 'depth_'). The produced horizon label columns are named
+        'horizon_<h>' for each horizon, and a 'sample_weights' column is
+        added. The resulting DataFrame is trimmed by the maximum horizon to
+        remove rows that do not have complete label information and the
+        auxiliary time columns 'create_time' and 'open_time' are dropped
+        before returning.
+
+        Args:
+            df: Input DataFrame containing at least a 'close' column and
+                depth columns prefixed with 'depth_'.
+            horizons: Sequence of forecasting horizons to generate labels for.
+            alpha: Tuning parameter passed to the LabelGenerator.
+            k_imb: Tuning parameter passed to the LabelGenerator.
+            k_liq: Tuning parameter passed to the LabelGenerator.
+            gamma_strong: Tuning parameter passed to the LabelGenerator.
+            span_sig: Span parameter passed to the LabelGenerator.
+            band_cols: Depth band indices to use when generating labels.
+            floor_bp: Minimum price move (in bp) used by the LabelGenerator.
+            roll_liq: Rolling window size for computing liquidity statistics.
+
+        Returns:
+            The input DataFrame augmented with horizon label columns and a
+            'sample_weights' column, trimmed to exclude rows without full
+            horizon labels.
+
+        Raises:
+            ValueError: If the number of generated labels or sample weights
+                does not match the number of input rows, or if NaN values are
+                present in the labeled DataFrame.
+        """
+        gen = LabelGenerator(
+            horizons=horizons,
+            band_cols=band_cols,
+            floor_bp=floor_bp,
+            alpha=alpha,
+            k_imb=k_imb,
+            k_liq=k_liq,
+            gamma_strong=gamma_strong,
+            span_sig=span_sig,
+            roll_liq=roll_liq,
+        )
+        
+        _, labels_5, _, sample_weights, _ = gen.build_labels(
+            df["close"], df[[col for col in df.columns if col.startswith("depth_")]]
+        )
+
+        if not (labels_5.shape[0] == sample_weights.shape[0] == df.shape[0]):
+            raise ValueError("Mismatch in number of samples between labels, sample weights, and input data.")
+
+        max_horizon = labels_5.columns[-1]
+        df[[f"horizon_{horizon}" for horizon in labels_5.columns]] = labels_5.values.astype(np.int64)
+        df["sample_weights"] = sample_weights.values
+        df = df.iloc[:-max_horizon]
+
+        if df.isna().any().any():
+            raise ValueError("NaN values found in the labeled DataFrame.")
+        
+        return df.drop(columns=["create_time", "open_time"])
 
     @classmethod
     def split_data_random(

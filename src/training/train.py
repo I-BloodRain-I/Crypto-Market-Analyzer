@@ -16,6 +16,7 @@ Example:
 
 import os
 import logging
+from tqdm.auto import tqdm
 from pathlib import Path
 from copy import deepcopy
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -24,10 +25,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
-from torchmetrics import Accuracy, Precision, Recall, F1Score
-from tqdm.auto import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import _LRScheduler, LinearLR, SequentialLR, ReduceLROnPlateau
+from torchmetrics.classification.base import _ClassificationTaskWrapper
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ class MetricsCollection:
     the average or total loss can be reported alongside computed metrics.
     """
 
-    def __init__(self, metrics: Dict[str, F1Score], device: torch.device, log_folder: Optional[str] = None):
+    def __init__(self, metrics: Dict[str, _ClassificationTaskWrapper], device: torch.device, log_folder: Optional[str] = None):
         """Create a MetricsCollection.
 
         Args:
@@ -220,6 +221,9 @@ class Trainer:
         enable_tensorboard: bool = True,
         experiment_name: Optional[str] = None,
         writer: Optional[SummaryWriter] = None,
+        scheduler: Optional[_LRScheduler] = None,
+        warmup_steps: int = 0,
+        step_scheduler_every_batch: bool = False,
     ):
         """Create a Trainer instance.
 
@@ -232,6 +236,9 @@ class Trainer:
             enable_tensorboard: Whether to enable TensorBoard logging. If False, no SummaryWriter will be created.
             experiment_name: Optional name for the TensorBoard experiment. If not provided, a default name will be generated.
             writer: Optional externally-created SummaryWriter instance to use.
+            scheduler: Optional ready-to-use PyTorch LR scheduler (any subclass of _LRScheduler).
+            warmup_steps: Number of initial steps (batches or epochs depending on stepping mode) to linearly warm up the LR.
+            step_scheduler_every_batch: Whether to call scheduler.step() after every optimizer update (per-batch). If False, scheduler.step() is called once per epoch.
         """
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -257,6 +264,17 @@ class Trainer:
             self.writer = writer if writer is not None else SummaryWriter(str(self.TENSORBOARD_FOLDER / experiment_name))
         else:
             self.writer = None
+
+        # Scheduler / warmup settings
+        self.step_scheduler_every_batch = step_scheduler_every_batch
+        self.scheduler = scheduler
+
+        if warmup_steps > 0 and scheduler is not None:
+            warmup = LinearLR(optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
+            self.scheduler = SequentialLR(optimizer, schedulers=[warmup, scheduler], milestones=[warmup_steps])
+        
+        if self.scheduler is not None and not hasattr(self.scheduler, "step"):
+            raise TypeError("scheduler must be a valid PyTorch scheduler with a .step() method")
 
     def _log_model_graph(self, data_loader: Optional[DataLoader] = None) -> None:
         """Log the model graph to TensorBoard using an example input.
@@ -322,14 +340,13 @@ class Trainer:
         """
         train_metrics = MetricsCollection(metrics, self.device)
         val_metrics = MetricsCollection(metrics, self.device)
-
         stopper = EarlyStopping(**early_stopping) if early_stopping else None
 
-        # Optionally log the model graph once before training
         if log_graph and self.writer is not None:
             self._log_model_graph(data_loader=train_loader)
-        
+
         for epoch in range(num_epochs):
+            self.model.train()
             train_metrics.reset()
             val_metrics.reset()
 
@@ -337,31 +354,15 @@ class Trainer:
             self._test(val_loader, val_metrics)
             self.log(epoch, train_metrics, val_metrics)
 
-            # Write metrics to TensorBoard
-            if self.writer is not None:
-                train_results = train_metrics.compute_metrics()
-                val_results = val_metrics.compute_metrics()
-                step = epoch + 1
-                for key, val in train_results.items():
-                    self.writer.add_scalar(f"train/{key}", val, step)
-                for key, val in val_results.items():
-                    self.writer.add_scalar(f"val/{key}", val, step)
+            self._step_scheduler_epoch(val_metrics)
 
-            # Early stopping check
+            if self.writer is not None:
+                self._log_tensorboard_epoch(train_metrics, val_metrics, epoch)
+
             if stopper:
-                val_results = val_metrics.compute_metrics()
-                monitor_value = val_results.get(stopper.monitor)
-                if monitor_value is None:
-                    logger.warning(f"EarlyStopping monitor '{stopper.monitor}' not found in validation results; skipping early-stopping check")
-                else:
-                    try:
-                        monitor_value = float(monitor_value)
-                    except (TypeError, ValueError):
-                        logger.warning(f"EarlyStopping monitor '{stopper.monitor}' value is not a float: {monitor_value}; skipping early-stopping check")
-                    else:
-                        if stopper.step(monitor_value):
-                            logger.info(f"Early stopping triggered (no improvement in '{stopper.monitor}' for {stopper.patience} epochs)")
-                            break
+                if self._handle_early_stopping(stopper, val_metrics):
+                    logger.info(f"Early stopping triggered: no improvement in {stopper.monitor}")
+                    break
 
         test_metrics = None
         if test_loader:
@@ -371,29 +372,119 @@ class Trainer:
 
             if self.writer is not None:
                 test_results = test_metrics.compute_metrics()
-                step = num_epochs
                 for key, val in test_results.items():
-                    self.writer.add_scalar(f"test/{key}", val, step)
+                    self.writer.add_scalar(f"test/{key}", val, num_epochs)
 
         if self.writer is not None:
             self.writer.flush()
             self.writer.close()
 
-        def _create_output_dict(mc: MetricsCollection) -> Dict[str, List[float]]:
-            result = {}
-            metrics = mc.compute_metrics()
-            for name, vals in mc.get_all_saved_records().items():
-                result[name] = {
-                    "steps": vals,
-                    "final": metrics[name]
-                }
-            return result
-
         return {
-            "train": _create_output_dict(train_metrics),
-            "val": _create_output_dict(val_metrics),
-            "test": _create_output_dict(test_metrics) if test_metrics else None
+            "train": self._create_output_dict(train_metrics),
+            "val": self._create_output_dict(val_metrics),
+            "test": self._create_output_dict(test_metrics) if test_metrics else None,
         }
+
+
+    def _step_scheduler_epoch(self, val_metrics: MetricsCollection) -> None:
+        """Perform scheduler stepping at the end of an epoch if configured.
+
+        This handles both standard schedulers (step once per epoch) and
+        ReduceLROnPlateau which requires a monitored metric value from the
+        validation metrics.
+
+        Args:
+            val_metrics: Validation metrics collection used to obtain the monitor value.
+
+        Returns:
+            None
+        """
+        if self.scheduler is not None and not self.step_scheduler_every_batch:
+            try:
+
+                # Handle ReduceLROnPlateau separately
+                if isinstance(self.scheduler, ReduceLROnPlateau):
+                    val_results = val_metrics.compute_metrics()
+                    monitor_value = val_results.get("loss", None)
+                    if monitor_value is not None:
+                        self.scheduler.step(monitor_value)
+                    else:
+                        logger.warning("ReduceLROnPlateau requires 'loss' metric; skipping scheduler step.")
+                else:
+                    self.scheduler.step()
+            except Exception as e:
+                logger.warning(f"Scheduler step (per-epoch) failed: {e}")
+
+    def _log_tensorboard_epoch(
+        self, 
+        train_metrics: MetricsCollection, 
+        val_metrics: MetricsCollection, 
+        epoch: int
+    ) -> None:
+        """Log training and validation metrics and the learning rate to TensorBoard.
+
+        Args:
+            train_metrics: MetricsCollection with accumulated training metrics for the epoch.
+            val_metrics: MetricsCollection with accumulated validation metrics for the epoch.
+            epoch: Zero-based epoch index used to compute the TensorBoard step.
+
+        Returns:
+            None
+        """
+        train_results = train_metrics.compute_metrics()
+        val_results = val_metrics.compute_metrics()
+        step = epoch + 1
+        for key, val in train_results.items():
+            self.writer.add_scalar(f"train/{key}", val, step)
+        for key, val in val_results.items():
+            self.writer.add_scalar(f"val/{key}", val, step)
+
+        # log LR
+        try:
+            lr = self.optimizer.param_groups[0].get("lr", None)
+            if lr is not None:
+                self.writer.add_scalar("lr", lr, step)
+        except Exception as e:
+            logger.warning(f"Failed to log LR: {e}")
+
+    def _handle_early_stopping(self, stopper: EarlyStopping, val_metrics: MetricsCollection) -> bool:
+        """Evaluate the early stopping criterion using validation metrics.
+
+        Args:
+            stopper: EarlyStopping instance tracking the monitored metric and patience.
+            val_metrics: Validation metrics collection from which the monitored value is read.
+
+        Returns:
+            True if training should be stopped according to the stopper, otherwise False.
+        """
+        val_results = val_metrics.compute_metrics()
+        monitor_value = val_results.get(stopper.monitor)
+        if monitor_value is not None:
+            try:
+                monitor_value = float(monitor_value)
+                return stopper.step(monitor_value)
+            except (TypeError, ValueError):
+                logger.warning(f"Invalid monitor value for early stopping: {monitor_value}")
+        return False
+
+    def _create_output_dict(self, mc: MetricsCollection) -> Dict[str, Any]:
+        """Build the serialized output dictionary from a MetricsCollection.
+
+        The returned mapping contains each metric name mapping to a dict with
+        recorded stepwise values under "steps" and the final aggregated
+        value under "final".
+
+        Args:
+            mc: MetricsCollection to serialize.
+
+        Returns:
+            A dictionary mapping metric names to their recorded steps and final value.
+        """
+        result = {}
+        metrics = mc.compute_metrics()
+        for name, vals in mc.get_all_saved_records().items():
+            result[name] = {"steps": vals, "final": metrics[name]}
+        return result
 
     def _train(self, train_loader: DataLoader, metrics: MetricsCollection) -> None:
         """Perform a single training epoch over the provided DataLoader.
@@ -420,6 +511,10 @@ class Trainer:
                 metrics.step(outputs.squeeze(-1), y_batch, loss)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+
+                # scheduler step per-batch (if configured)
+                if self.scheduler is not None and self.step_scheduler_every_batch:
+                    self.scheduler.step()
             else:
                 if isinstance(x_batch, list):
                     outputs = self.model(*x_batch)
@@ -429,6 +524,10 @@ class Trainer:
                 loss.backward()
                 metrics.step(outputs.squeeze(-1), y_batch, loss)
                 self.optimizer.step()
+
+                # scheduler step per-batch (if configured)
+                if self.scheduler is not None and self.step_scheduler_every_batch:
+                    self.scheduler.step()
 
     def _test(self, test_loader: DataLoader, metrics: MetricsCollection) -> None:
         """Evaluate the model on data from ``test_loader`` without updating parameters.
@@ -459,7 +558,10 @@ class Trainer:
                     loss = self.loss_fn(outputs, y_batch)
                 metrics.step(outputs, y_batch, loss)
 
-    def _to_device(self, batch: Union[List[torch.Tensor], torch.Tensor]) -> Union[List[torch.Tensor], torch.Tensor]:
+    def _to_device(
+        self, 
+        batch: Union[List[torch.Tensor], torch.Tensor]
+    ) -> Union[List[torch.Tensor], torch.Tensor]:
         if isinstance(batch, list):
             return [x.to(self.device, non_blocking=True) for x in batch]
         return batch.to(self.device, non_blocking=True)
@@ -481,55 +583,3 @@ class Trainer:
         log_msg += f"Train Metrics: {train_metrics_eval.format_metrics_to_string()}\n"
         log_msg += f"Val Metrics:   {val_metrics_eval.format_metrics_to_string()}\n"
         logger.info(log_msg)
-
-
-if __name__ == "__main__":
-    model = nn.Sequential(
-        nn.Linear(10, 50),
-        nn.ReLU(),
-        nn.Linear(50, 2)
-    )
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    loss_fn = nn.CrossEntropyLoss()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    metrics = MetricsCollection(
-        metrics=[
-            Accuracy(task="multiclass", num_classes=2), 
-            Precision(task="multiclass", num_classes=2), 
-            Recall(task="multiclass", num_classes=2), 
-            F1Score(task="multiclass", num_classes=2)
-        ],
-        device=device
-    )
-
-    trainer = Trainer(model, optimizer, loss_fn, device, use_amp=True)
-
-    # Dummy DataLoader for illustration; replace with actual data loaders
-    train_loader = DataLoader(
-        [(
-            torch.randn(10), 
-            torch.randint(0, 2, (1,)).item()
-        ) for _ in range(100)], 
-        batch_size=32
-    )
-    val_loader = DataLoader(
-        [(
-            torch.randn(10), 
-            torch.randint(0, 2, (1,)).item()
-        ) for _ in range(20)], 
-        batch_size=32
-    )
-
-    trainer.train(
-        num_epochs=50, 
-        train_loader=train_loader, 
-        val_loader=val_loader, 
-        metrics=[
-            Accuracy(task="multiclass", num_classes=2), 
-            Precision(task="multiclass", num_classes=2), 
-            Recall(task="multiclass", num_classes=2), 
-            F1Score(task="multiclass", num_classes=2)
-        ],
-        early_stopping={"monitor": "MulticlassAccuracy", "patience": 5, "mode": "max"}
-    )

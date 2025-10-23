@@ -414,7 +414,7 @@ class MultiHorizonTransformer(nn.Module):
         static_feats: [B, F_s] - Time-invariant features (optional)
     
     Output:
-        Dictionary containing:
+        Tuple containing:
             - 'y_hat': [B, K, out_dim] - Predictions for target horizons
             - 'y_hat_full': [B, H, out_dim] - Full sequence (if return_full=True)
     
