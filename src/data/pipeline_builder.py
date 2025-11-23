@@ -4,7 +4,7 @@ This module provides PipelineBuilder which constructs a ColumnTransformer-based
 preprocessing pipeline from a PipelineConfig instance.
 """
 
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Literal
 
 import numpy as np
 from sklearn.impute import SimpleImputer
@@ -12,7 +12,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import FunctionTransformer, Pipeline
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, OneHotEncoder
 
-from .config import CustomTransformerConfig, DataPipelineConfig, FeatureScalingConfig, LambdaFunctionConfig
+from .config import DataPipelineConfig, FeatureScalingConfig
 
 
 class PipelineBuilder:
@@ -34,17 +34,10 @@ class PipelineBuilder:
         """
         transformers = []
 
-        if config.numerical_std and config.numerical_std.features:
-            num_std_pipeline = cls._create_numerical_pipeline(config.numerical_std)
-            transformers.append(("num_std", num_std_pipeline, config.numerical_std.features))
-
-        if config.numerical_robust and config.numerical_robust.features:
-            num_robust_pipeline = cls._create_numerical_pipeline(config.numerical_robust)
-            transformers.append(("num_robust", num_robust_pipeline, config.numerical_robust.features))
-
-        if config.numerical_minmax and config.numerical_minmax.features:
-            num_minmax_pipeline = cls._create_numerical_pipeline(config.numerical_minmax)
-            transformers.append(("num_minmax", num_minmax_pipeline, config.numerical_minmax.features))
+        if config.numerical:
+            for i, cfg in enumerate(config.numerical):
+                num_pipeline = cls._create_numerical_pipeline(cfg)
+                transformers.append((f"num{i}", num_pipeline, cfg.features))
 
         if config.categorical and config.categorical.features:
             cat_pipeline = cls._create_categorical_pipeline(config.categorical, config.handle_unknown)
@@ -93,11 +86,11 @@ class PipelineBuilder:
             steps.append(("imputer", SimpleImputer(**impute_kwargs)))
 
         if cfg.scaler == "standard":
-            steps.append(("scaler", StandardScaler()))
+            steps.append(("scaler", StandardScaler(**cfg.params)))
         elif cfg.scaler == "minmax":
-            steps.append(("scaler", MinMaxScaler()))
+            steps.append(("scaler", MinMaxScaler(**cfg.params)))
         elif cfg.scaler == "robust":
-            steps.append(("scaler", RobustScaler()))
+            steps.append(("scaler", RobustScaler(**cfg.params)))
 
         return Pipeline(steps=steps)
 
@@ -122,7 +115,7 @@ class PipelineBuilder:
                 impute_kwargs["fill_value"] = cfg.fill_value
             steps.append(("imputer", SimpleImputer(**impute_kwargs)))
 
-        encoder = OneHotEncoder(handle_unknown=handle_unknown, sparse_output=False)
+        encoder = OneHotEncoder(handle_unknown=handle_unknown, sparse_output=False, **cfg.params)
         steps.append(("encoder", encoder))
 
         return Pipeline(steps=steps)
@@ -148,7 +141,7 @@ class PipelineBuilder:
                 impute_kwargs["fill_value"] = cfg.fill_value
             steps.append(("imputer", SimpleImputer(**impute_kwargs)))
 
-        encoder = OneHotEncoder(handle_unknown=handle_unknown, drop="if_binary", sparse_output=False)
+        encoder = OneHotEncoder(handle_unknown=handle_unknown, drop="if_binary", sparse_output=False, **cfg.params)
         steps.append(("encoder", encoder))
 
         return Pipeline(steps=steps)

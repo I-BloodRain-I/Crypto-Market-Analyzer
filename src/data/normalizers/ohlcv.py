@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Iterable
+from typing import Dict, List, Optional, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
@@ -26,10 +26,13 @@ class OHLCVNormalizer(BaseEstimator, TransformerMixin):
             None disables lagged features. Only positive integers are used.
         add_raw_relative: If True, output includes both normalized (``*_z``) and
             raw engineered features. If False, only normalized features.
+        window: Rolling window size for computing means and standard deviations.
+        min_periods: Minimum periods required for rolling statistics.
         eps: Small constant added to denominators and inside logarithms for
             numerical stability (prevents division by zero and log(0)).
-        clip_pct_change: Absolute clipping threshold for volume percent change.
-            None disables clipping. Default 10.0 clips at ±1000%.
+        clip_quantiles: Tuple of (lower, upper) quantiles to clip computed z-scores.
+            None disables clipping.
+        copy: If True, a copy of the input data is made before any transformations.
 
     Notes:
         Initial rows contain NaN due to shifting (``shift(1)`` for base features,
@@ -47,22 +50,32 @@ class OHLCVNormalizer(BaseEstimator, TransformerMixin):
         v_col: str = "volume",
         lags: Optional[Iterable[int]] = (2, 3, 5, 10, 15),
         add_raw_relative: bool = False,
+        window: int = 240,
+        min_periods: int = 10,
         eps: float = 1e-12,
-        clip_pct_change: Optional[float] = 10.0,
+        clip_quantiles: Tuple[float, float] = (0.01, 0.99),
+        copy: bool = True,
     ):
         self.o_col = o_col
         self.h_col = h_col
         self.l_col = l_col
         self.c_col = c_col
         self.v_col = v_col
+
         self.lags = lags
         self.add_raw_relative = add_raw_relative
-        self.eps = eps
-        self.clip_pct_change = clip_pct_change
+        
+        self.window = int(window)
+        self.min_periods = int(min_periods)
+        self.eps = float(eps)
+        self.clip_quantiles = clip_quantiles
+        self.copy = copy
 
-        self.feature_stats_: Dict[str, Dict[str, float]] = {}
+        self._lags_: List[int] = []
         self.fitted_: bool = False
+        self.warmup_tail: Optional[pd.DataFrame] = None
         self._last_feature_order_: List[str] = []
+        self._feature_quantiles: Dict[str, Tuple[float, float]] = {}
 
     def _zscore_base_features(self) -> List[str]:
         """
@@ -147,46 +160,43 @@ class OHLCVNormalizer(BaseEstimator, TransformerMixin):
             DataFrame with original columns plus new base features
         """
         eps = float(self.eps)
-        df = df.copy()
+        out = df.copy() if self.copy else df
 
-        o = df[self.o_col].astype(float)
-        h = df[self.h_col].astype(float)
-        l = df[self.l_col].astype(float)
-        c = df[self.c_col].astype(float)
-        v = df[self.v_col].astype(float)
+        o = out[self.o_col].astype(float)
+        h = out[self.h_col].astype(float)
+        l = out[self.l_col].astype(float)
+        c = out[self.c_col].astype(float)
+        v = out[self.v_col].astype(float)
 
         prev_c = c.shift(1)
 
         inv_prev_c = 1.0 / (np.abs(prev_c) + eps)
-        df["open_rel_prev"]  = o * inv_prev_c - 1.0
-        df["high_rel_prev"]  = h * inv_prev_c - 1.0
-        df["low_rel_prev"]   = l * inv_prev_c - 1.0
-        df["close_rel_prev"] = c * inv_prev_c - 1.0
+        out["open_rel_prev"]  = o * inv_prev_c - 1.0
+        out["high_rel_prev"]  = h * inv_prev_c - 1.0
+        out["low_rel_prev"]   = l * inv_prev_c - 1.0
+        out["close_rel_prev"] = c * inv_prev_c - 1.0
 
         denom_o = np.abs(o) + eps
-        df["body_rel_open"]     = (c - o) / denom_o
-        df["wick_top_rel_open"] = (h - np.maximum(o, c)) / denom_o
-        df["wick_bot_rel_open"] = (np.minimum(o, c) - l) / denom_o
-        df["hl_range_rel"]      = (h - l) / denom_o
+        out["body_rel_open"]     = (c - o) / denom_o
+        out["wick_top_rel_open"] = (h - np.maximum(o, c)) / denom_o
+        out["wick_bot_rel_open"] = (np.minimum(o, c) - l) / denom_o
+        out["hl_range_rel"]      = (h - l) / denom_o
 
         tr = np.maximum.reduce([(h - l), (h - prev_c).abs(), (l - prev_c).abs()])
-        df["true_range_rel"] = tr / (np.abs(prev_c) + eps)
+        out["true_range_rel"] = tr / (np.abs(prev_c) + eps)
 
-        df["ret_1"]    = np.log((c + eps) / (prev_c + eps))
-        df["gap_open"] = (o / (prev_c + eps)) - 1.0
+        out["ret_1"]    = np.log((c + eps) / (prev_c + eps))
+        out["gap_open"] = (o / (prev_c + eps)) - 1.0
 
         v_pos = np.maximum(v, 0.0)
-        df["volume_log"] = np.log1p(v_pos)
+        out["volume_log"] = np.log1p(v_pos)
 
-        vol_pct = v.pct_change()
-        if self.clip_pct_change is not None:
-            vol_pct = vol_pct.clip(-self.clip_pct_change, self.clip_pct_change)
-        df["volume_pct"] = vol_pct
+        out["volume_pct"] = v.pct_change()
 
         dollar_vol = v * c
-        df["dollar_volume_log"] = np.log1p(np.maximum(dollar_vol, 0.0))
+        out["dollar_volume_log"] = np.log1p(np.maximum(dollar_vol, 0.0))
 
-        df["price_impact_vol"] = df["hl_range_rel"] * df["volume_log"]
+        out["price_impact_vol"] = out["hl_range_rel"] * out["volume_log"]
 
         for col in [
             "open_rel_prev", "high_rel_prev", "low_rel_prev", "close_rel_prev",
@@ -194,10 +204,10 @@ class OHLCVNormalizer(BaseEstimator, TransformerMixin):
             "true_range_rel", "ret_1", "gap_open",
             "volume_log", "volume_pct", "dollar_volume_log", "price_impact_vol",
         ]:
-            s = df[col].astype(float)
-            df[col] = s.replace([np.inf, -np.inf], np.nan)
+            s = out[col].astype(float)
+            out[col] = s.replace([np.inf, -np.inf], np.nan)
 
-        return df
+        return out
 
     def _add_lagged_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -212,9 +222,9 @@ class OHLCVNormalizer(BaseEstimator, TransformerMixin):
         Returns:
             DataFrame with original features plus lagged and relative-to-past features
         """
-        df = df.copy()
+        out = df.copy() if self.copy else df
         if not self._lags_:
-            return df
+            return out
 
         snapshot_cols = [
             "body_rel_open", "wick_top_rel_open", "wick_bot_rel_open",
@@ -224,59 +234,37 @@ class OHLCVNormalizer(BaseEstimator, TransformerMixin):
         ]
         for k in self._lags_:
             for col in snapshot_cols:
-                df[f"{col}_lag{k}"] = df[col].shift(k)
+                out[f"{col}_lag{k}"] = out[col].shift(k)
 
-        o = df[self.o_col].astype(float)
-        h = df[self.h_col].astype(float)
-        l = df[self.l_col].astype(float)
-        c = df[self.c_col].astype(float)
+        o = out[self.o_col].astype(float)
+        h = out[self.h_col].astype(float)
+        l = out[self.l_col].astype(float)
+        c = out[self.c_col].astype(float)
         eps = float(self.eps)
 
         for k in self._lags_:
             c_k = c.shift(k)
-            df[f"ret_{k}"] = np.log((c + eps) / (c_k + eps))
-            df[f"gap_open_{k}"] = (o / (c_k + eps)) - 1.0
+            out[f"ret_{k}"] = np.log((c + eps) / (c_k + eps))
+            out[f"gap_open_{k}"] = (o / (c_k + eps)) - 1.0
 
             o_k = o.shift(k); h_k = h.shift(k); l_k = l.shift(k)
-            df[f"dclose_{k}"] = (c - c_k) / (np.abs(c_k) + eps)
-            df[f"dopen_{k}"]  = (o - o_k) / (np.abs(o_k) + eps)
-            df[f"dhigh_{k}"]  = (h - h_k) / (np.abs(h_k) + eps)
-            df[f"dlow_{k}"]   = (l - l_k) / (np.abs(l_k) + eps)
+            out[f"dclose_{k}"] = (c - c_k) / (np.abs(c_k) + eps)
+            out[f"dopen_{k}"]  = (o - o_k) / (np.abs(o_k) + eps)
+            out[f"dhigh_{k}"]  = (h - h_k) / (np.abs(h_k) + eps)
+            out[f"dlow_{k}"]   = (l - l_k) / (np.abs(l_k) + eps)
 
-        for col in df.columns:
+        for col in out.columns:
             if col in [self.o_col, self.h_col, self.l_col, self.c_col, self.v_col]:
                 continue
-            if df[col].dtype.kind in "fc":
-                df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+            if out[col].dtype.kind in "fc":
+                out[col] = out[col].replace([np.inf, -np.inf], np.nan)
 
-        return df
+        return out
 
-    def _compute_stats(self, df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    def _apply_rolling_zscore(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Compute mean and standard deviation for each feature to be z-score normalized.
-        
-        Uses nanmean and nanstd to handle NaN values properly during statistics computation.
+        Apply rolling z-score normalization to features using fitted statistics.
 
-        Args:
-            df: DataFrame containing all computed features
-
-        Returns:
-            Dictionary mapping feature names to their statistics (mean, std)
-        """
-        stats: Dict[str, Dict[str, float]] = {}
-        for col in self._zscore_feature_list():
-            if col in df.columns:
-                x = df[col].astype(float).values
-                mean = float(np.nanmean(x))
-                std = float(np.nanstd(x))
-                std = std if std > float(self.eps) else 1.0
-                stats[col] = {"mean": mean, "std": std}
-        return stats
-
-    def _apply_zscore(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Apply z-score normalization to features using fitted statistics.
-        
         Creates new columns with '_z' suffix containing z-score normalized values.
 
         Args:
@@ -285,10 +273,16 @@ class OHLCVNormalizer(BaseEstimator, TransformerMixin):
         Returns:
             DataFrame with original features plus z-score normalized versions
         """
-        out = df.copy()
-        for col, ms in self.feature_stats_.items():
-            if col in out.columns:
-                out[f"{col}_z"] = (out[col].astype(float) - ms["mean"]) / ms["std"]
+        out = df.copy() if self.copy else df
+        cols = [c for c in self._zscore_feature_list() if c in out.columns]
+
+        for col in cols:
+            s = out[col].astype(float)
+            mu = s.rolling(self.window, min_periods=self.min_periods).mean().shift(1)
+            sd = s.rolling(self.window, min_periods=self.min_periods).std().shift(1)
+            z = (s - mu) / (sd.replace(0.0, np.nan) + self.eps)
+            out[f"{col}_z"] = z
+
         return out
 
     def fit(self, X: pd.DataFrame, y=None):
@@ -318,9 +312,9 @@ class OHLCVNormalizer(BaseEstimator, TransformerMixin):
                     continue
             self._lags_ = sorted(set(_lags))
 
-        feats = self._build_base_features(X)
-        feats = self._add_lagged_features(feats)
-        self.feature_stats_ = self._compute_stats(feats)
+        n_tail = max(self.window - 1, 0)
+        self._warmup_tail_ = X.tail(n_tail).copy() if n_tail > 0 and len(X) > 0 else None
+
         self.fitted_ = True
         return self
 
@@ -340,15 +334,44 @@ class OHLCVNormalizer(BaseEstimator, TransformerMixin):
         if not self.fitted_:
             raise RuntimeError("Call fit() before transform().")
 
-        feats = self._build_base_features(X)
+        use_ctx = self._warmup_tail_ is not None and len(self._warmup_tail_) > 0
+        src = pd.concat([self._warmup_tail_, X], axis=0) if use_ctx else X
+
+        feats = self._build_base_features(src)
         feats = self._add_lagged_features(feats)
-        out = self._apply_zscore(feats)
+
+        out = self._apply_rolling_zscore(feats)
+
+        candidate_keep = [c for c in out.columns if c.endswith("_z")]
+        if self.add_raw_relative:
+            for c in self._zscore_feature_list():
+                if c in out.columns and c not in candidate_keep:
+                    candidate_keep.append(c)
+
+        if not self._feature_quantiles:
+            clip_low, clip_high = self.clip_quantiles if isinstance(self.clip_quantiles, tuple) else (0.01, 0.99)
+            for c in candidate_keep:
+                try:
+                    low = out[c].quantile(clip_low)
+                    high = out[c].quantile(clip_high)
+                except Exception:
+                    low, high = (np.nan, np.nan)
+                self._feature_quantiles[c] = (low, high)
+
+        # apply quantile-based clipping for any known feature quantiles
+        for c, (low, high) in self._feature_quantiles.items():
+            if c in out.columns and not (pd.isna(low) or pd.isna(high)):
+                out[c] = out[c].clip(lower=low, upper=high)
+
+        out = out.iloc[len(self._warmup_tail_):] if use_ctx else out
+
+        n_tail = max(self.window - 1, 0)
+        self._warmup_tail_ = src.tail(n_tail).copy() if n_tail > 0 and len(src) > 0 else None
 
         keep = [c for c in out.columns if c.endswith("_z")]
-
         if self.add_raw_relative:
-            for c in out.columns:
-                if c not in keep and c not in [self.o_col, self.h_col, self.l_col, self.c_col, self.v_col]:
+            for c in self._all_feature_list_for_z():
+                if c in out.columns and c not in keep:
                     keep.append(c)
 
         seen, ordered = set(), []
@@ -359,7 +382,7 @@ class OHLCVNormalizer(BaseEstimator, TransformerMixin):
         final = out[ordered].copy()
         final = final.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-        self._last_feature_order_ = ordered
+        self._last_feature_order_: List[str] = ordered
         return final
 
     def fit_transform(self, X: pd.DataFrame, y=None):
@@ -398,12 +421,3 @@ class OHLCVNormalizer(BaseEstimator, TransformerMixin):
             if c not in seen:
                 ordered.append(c); seen.add(c)
         return ordered
-
-    def get_stats(self) -> Dict[str, Dict[str, float]]:
-        """
-        Get computed feature statistics (mean and std) used for normalization.
-
-        Returns:
-            Dictionary mapping feature names to their computed statistics
-        """
-        return {k: dict(v) for k, v in self.feature_stats_.items()}

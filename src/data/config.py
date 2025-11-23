@@ -18,7 +18,7 @@ import json
 import inspect
 import importlib
 from pathlib import Path
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel
 
@@ -65,11 +65,13 @@ class FeatureScalingConfig(BaseModel):
         impute_strategy: Strategy to use for imputing missing values.
         scaler: Which scaler to apply after imputation.
         fill_value: Value used when `impute_strategy` is set to "constant".
+        params: Additional parameters for the scaler if needed.
     """
     features: List[str]
     impute_strategy: Optional[Literal["mean", "median", "most_frequent", "constant"]] = None
     scaler: Literal["standard", "minmax", "robust", "none"] = "standard"
     fill_value: Union[int, float, str, None] = 0  # Used if strategy is "constant"
+    params: Dict[str, Any] = {}
 
 
 class DataPipelineConfig(BaseModel):
@@ -81,9 +83,7 @@ class DataPipelineConfig(BaseModel):
     remainder columns when composing a ColumnTransformer.
 
     Attributes:
-        numerical_std: Configuration for features that should be standardized.
-        numerical_robust: Configuration for features that should use a robust scaler.
-        numerical_minmax: Configuration for features that should be min-max scaled.
+        numerical: Configuration for features that should be standardized.
         categorical: Configuration for categorical features (imputation/encoding).
         binary: Configuration for binary features.
         lambda_func: List of lambda function configurations to apply to features.
@@ -92,9 +92,7 @@ class DataPipelineConfig(BaseModel):
         rolling_window: Optional rolling window size to apply rolling mean on numeric features before scaling.
         remainder: What to do with columns not targeted by any transformer (drop or passthrough).
     """
-    numerical_std: Optional[FeatureScalingConfig] = None
-    numerical_robust: Optional[FeatureScalingConfig] = None
-    numerical_minmax: Optional[FeatureScalingConfig] = None
+    numerical: Optional[List[FeatureScalingConfig]] = None
     categorical: Optional[FeatureScalingConfig] = None
     binary: Optional[FeatureScalingConfig] = None
     lambda_funcs: Optional[List[LambdaFunctionConfig]] = None
@@ -134,23 +132,18 @@ class DataPipelineConfig(BaseModel):
                     CustomTransformerConfig(
                         features=cfg["features"],
                         instance=getattr(
-                            importlib.import_module(cfg["instance"].rsplit(".", 1)[0]),
-                            cfg["instance"].rsplit(".", 1)[1]
+                            importlib.import_module("src.data.normalizers"),
+                            cfg["instance"]
                         )(**cfg["params"])
                     )
                 )
                 
 
         return DataPipelineConfig(
-            numerical_std=FeatureScalingConfig(
-                **loaded_json["numerical_std"]
-            ) if loaded_json["numerical_std"] else None,
-            numerical_robust=FeatureScalingConfig(
-                **loaded_json["numerical_robust"]
-            ) if loaded_json["numerical_robust"] else None,
-            numerical_minmax=FeatureScalingConfig(
-                **loaded_json["numerical_minmax"]
-            ) if loaded_json["numerical_minmax"] else None,
+            numerical=[
+                FeatureScalingConfig(**cfg) 
+                for cfg in loaded_json["numerical"]
+            ] if loaded_json["numerical"] else None,
             categorical=FeatureScalingConfig(
                 **loaded_json["categorical"]
             ) if loaded_json["categorical"] else None,

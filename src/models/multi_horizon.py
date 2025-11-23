@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -90,6 +91,17 @@ class MultiHorizonTransformerConfig:
     grn_hidden: int = 256
 
     init_gain: float = 1.0
+
+    def save(self, path: str):
+        """Saves the configuration to a JSON file."""
+        with open(path, "w") as f:
+            json.dump(self.__dict__, f, indent=4)
+
+    def load(path: str) -> "MultiHorizonTransformerConfig":
+        """Loads the configuration from a JSON file."""
+        with open(path, "r") as f:
+            data = json.load(f)
+        return MultiHorizonTransformerConfig(**data)
 
 
 def causal_mask(sz: int, device: torch.device) -> torch.Tensor:
@@ -233,7 +245,7 @@ class VariableSelectionNetwork(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3:
             B, T, F = x.shape
-            assert F == self.num_features
+            assert F == self.num_features, f"Expected {self.num_features} features, got {F}"
             embs = []
             scores = []
             for f in range(F):
@@ -583,10 +595,6 @@ class MultiHorizonTransformer(nn.Module):
         assert B == B2 and L == cfg.context_len and H == cfg.max_horizon, f"Invalid shapes for past/future. Expected B={B}, L={cfg.context_len}, H={cfg.max_horizon}."
         if static_feats is not None:
             assert static_feats.shape[0] == B and static_feats.shape[1] == cfg.static_feat_dim, f"Invalid static shape. Expected B={B}, F_s={cfg.static_feat_dim}."
-        assert (not cfg.use_quantiles and cfg.out_dim == 1) or \
-            (cfg.use_quantiles and cfg.out_dim == len(cfg.quantiles)), \
-            "Mismatch: set out_dim=1 for point forecast, or out_dim=len(quantiles) with use_quantiles=True."
-
 
         static_ctx = None
         if self.static_vsn is not None and static_feats is not None:
@@ -618,7 +626,7 @@ class MultiHorizonTransformer(nn.Module):
                 outs.append(self.per_head[str(h)](dec_sel[:, j, :]))        # [B, out_dim]
             y_sel = torch.stack(outs, dim=1)                                # [B, K, out_dim]
 
-        out = {"y_hat": y_sel}
+        y_sel = y_sel.permute(0, 2, 1)  # [B, out_dim, K]
         if return_full:
             return y_sel, y_full
         else:

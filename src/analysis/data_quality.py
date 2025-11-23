@@ -1,10 +1,297 @@
 from pathlib import Path
-from typing import Optional, List, Tuple
-
-import numpy as np
+from typing import Optional, List, Tuple, Dict, Union
 import pandas as pd
-import seaborn as sns
+import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
+from itertools import combinations
+from sklearn.metrics import roc_auc_score
+
+
+def balanced_correlation_ratio(y: np.ndarray, x: np.ndarray) -> float:
+    """Calculate Eta-squared with class-balanced weights.
+    
+    This metric adjusts for class imbalance by weighting each class inversely
+    proportional to its size, providing a more fair assessment of feature
+    importance in imbalanced datasets.
+
+    Args:
+        y: Target class labels
+        x: Feature values
+
+    Returns:
+        Balanced correlation ratio (Eta-squared) value between 0 and 1
+    """
+    y = np.asarray(y)
+    x = np.asarray(x)
+    m = np.isfinite(y) & np.isfinite(x)
+    y, x = y[m], x[m]
+    if x.size == 0:
+        return np.nan
+
+    classes, inv = np.unique(y, return_inverse=True)
+    if classes.size < 2:
+        return np.nan
+
+    class_counts = np.bincount(inv)
+    weights = 1.0 / class_counts
+    weights /= weights.sum()
+    
+    grand_mean = x.mean()
+    ss_between_weighted = 0.0
+    
+    for k in range(classes.size):
+        xk = x[inv == k]
+        if xk.size > 0:
+            ss_between_weighted += weights[k] * xk.size * (xk.mean() - grand_mean) ** 2
+    
+    ss_total = ((x - grand_mean) ** 2).sum()
+    return ss_between_weighted / ss_total if ss_total > 0 else 0.0
+
+
+def class_separation_score(y: np.ndarray, x: np.ndarray) -> float:
+    """Calculate how well a feature separates minority classes from majority class.
+    
+    This metric is specifically designed for imbalanced datasets, measuring
+    the effect size (Cohen's d) between minority and majority classes.
+
+    Args:
+        y: Target class labels
+        x: Feature values
+
+    Returns:
+        Cohen's d effect size measuring separation between classes
+    """
+    y = np.asarray(y)
+    x = np.asarray(x)
+    m = np.isfinite(y) & np.isfinite(x)
+    y, x = y[m], x[m]
+    
+    minority_mask = (y != 2)
+    majority_mask = (y == 2)
+    
+    if minority_mask.sum() < 2 or majority_mask.sum() < 2:
+        return np.nan
+    
+    x_minority = x[minority_mask]
+    x_majority = x[majority_mask]
+    
+    mean_diff = abs(x_minority.mean() - x_majority.mean())
+    pooled_std = np.sqrt((x_minority.var() + x_majority.var()) / 2)
+    
+    return mean_diff / pooled_std if pooled_std > 0 else 0.0
+
+
+def extreme_class_auc(y: np.ndarray, x: np.ndarray) -> float:
+    """Calculate AUC for separating extreme classes (0, 4) from others.
+    
+    Measures how well a feature can identify extreme/rare events, which is
+    critical for applications where detecting outliers is important.
+
+    Args:
+        y: Target class labels
+        x: Feature values
+
+    Returns:
+        AUC score for binary classification of extreme vs non-extreme classes
+    """
+    y = np.asarray(y)
+    x = np.asarray(x)
+    m = np.isfinite(y) & np.isfinite(x)
+    y, x = y[m], x[m]
+    
+    y_binary = ((y == 0) | (y == 4)).astype(int)
+    
+    if y_binary.sum() < 2 or (1 - y_binary).sum() < 2:
+        return np.nan
+    
+    try:
+        return roc_auc_score(y_binary, x)
+    except Exception:
+        return np.nan
+
+
+def pairwise_class_separation(y: np.ndarray, x: np.ndarray) -> float:
+    """Calculate average ability of a feature to separate all pairs of classes.
+    
+    This metric evaluates feature quality by measuring separation (Cohen's d)
+    for every possible pair of classes and averaging the results.
+
+    Args:
+        y: Target class labels
+        x: Feature values
+
+    Returns:
+        Average Cohen's d across all class pairs
+    """
+    y = np.asarray(y)
+    x = np.asarray(x)
+    m = np.isfinite(y) & np.isfinite(x)
+    y, x = y[m], x[m]
+    
+    classes = np.unique(y)
+    if len(classes) < 2:
+        return np.nan
+    
+    scores = []
+    
+    for c1, c2 in combinations(classes, 2):
+        mask = (y == c1) | (y == c2)
+        if mask.sum() < 4:
+            continue
+            
+        x_pair = x[mask]
+        y_pair = (y[mask] == c2).astype(int)
+        
+        x1 = x_pair[y_pair == 0]
+        x2 = x_pair[y_pair == 1]
+        
+        if len(x1) > 1 and len(x2) > 1:
+            mean_diff = abs(x1.mean() - x2.mean())
+            pooled_std = np.sqrt((x1.var() + x2.var()) / 2)
+            if pooled_std > 0:
+                scores.append(mean_diff / pooled_std)
+    
+    return np.mean(scores) if scores else np.nan
+
+
+def diagnose_imbalanced_features(X: Union[np.ndarray, pd.DataFrame], y: np.ndarray) -> List[Dict]:
+    """Perform specialized diagnostics for imbalanced classification datasets.
+    
+    Analyzes each feature using multiple metrics designed for imbalanced data:
+    - Balanced correlation ratio (Eta-squared with class weights)
+    - Class separation score (minority vs majority)
+    - Extreme class AUC (rare event detection)
+    - Pairwise class separation (average across all class pairs)
+
+    Args:
+        X: Feature matrix of shape (n_samples, n_features) as numpy array or DataFrame
+        y: Target labels of shape (n_samples,)
+
+    Returns:
+        List of dictionaries containing metrics for each feature, sorted by
+        pairwise separation score in descending order
+    """
+    is_dataframe = isinstance(X, pd.DataFrame)
+    if is_dataframe:
+        feature_names = X.columns.tolist()
+        X_array = X.values
+    else:
+        feature_names = [f"F{i}" for i in range(X.shape[1])]
+        X_array = X
+    
+    print(f"Class distribution: {np.bincount(y) / len(y) * 100}")
+    print(f"Total features: {X_array.shape[1]}\n")
+    
+    results = []
+    
+    for i in range(X_array.shape[1]):
+        x = X_array[:, i]
+        
+        eta2_bal = balanced_correlation_ratio(y, x)
+        sep_score = class_separation_score(y, x)
+        extreme_auc = extreme_class_auc(y, x)
+        pairwise_sep = pairwise_class_separation(y, x)
+        
+        results.append({
+            'feature': feature_names[i],
+            'eta2_balanced': eta2_bal,
+            'separation_score': sep_score,
+            'extreme_auc': extreme_auc,
+            'pairwise_sep': pairwise_sep,
+        })
+    
+    results = sorted(results, key=lambda r: r['pairwise_sep'] 
+                     if not np.isnan(r['pairwise_sep']) else -1, 
+                     reverse=True)
+    
+    col_width = max(8, max(len(str(r['feature'])) for r in results[:30]) + 2) if results else 8
+    
+    print("=" * 100)
+    print("TOP-30 Features (sorted by Pairwise Separation):")
+    print("=" * 100)
+    print(f"{'#':<4} {'Feature':<{col_width}} {'PairSep':<10} {'SepScore':<10} "
+          f"{'ExtAUC':<10} {'Eta²Bal':<10}")
+    print("-" * 100)
+    
+    for rank, r in enumerate(results[:30], 1):
+        print(f"{rank:<4} {str(r['feature']):<{col_width}} "
+              f"{r['pairwise_sep']:<10.4f} {r['separation_score']:<10.4f} "
+              f"{r['extreme_auc']:<10.4f} {r['eta2_balanced']:<10.4f}")
+    
+    print("\n" + "=" * 100)
+    print("STATISTICS:")
+    high_sep = sum(1 for r in results if r['pairwise_sep'] > 0.3)
+    print(f"Features with good separability (PairSep > 0.3): {high_sep}")
+    
+    high_extreme = sum(1 for r in results if r['extreme_auc'] > 0.6)
+    print(f"Features separating extreme classes (AUC > 0.6): {high_extreme}")
+    
+    return results
+
+
+def analyze_feature_groups(X: Union[np.ndarray, pd.DataFrame], y: np.ndarray) -> Dict[str, List[Dict]]:
+    """Analyze and group features by their predictive quality for imbalanced data.
+    
+    This function performs comprehensive feature analysis and categorizes features
+    into tiers based on their ability to separate classes. It's particularly useful
+    for imbalanced classification problems.
+    
+    Feature Tiers:
+    - Tier 1 (Strong): PairSep > 0.45 - Use for main model
+    - Tier 2 (Moderate): 0.25-0.45 - Add for ensembles
+    - Tier 3 (Weak): 0.10-0.25 - Use for interactions/nonlinear combinations
+    - Tier 4 (Very Weak): < 0.10 - Can be dropped or used for ensemble diversity
+    - Extreme Specialists: ExtAUC > 0.70 & PairSep > 0.30 - Critical for rare classes
+
+    Args:
+        X: Feature matrix of shape (n_samples, n_features) as numpy array or DataFrame
+        y: Target labels of shape (n_samples,)
+
+    Returns:
+        Dictionary containing feature groups:
+        - 'tier1': Strong predictors
+        - 'tier2': Moderate predictors
+        - 'tier3': Weak predictors
+        - 'tier4': Very weak predictors
+        - 'extreme_specialists': Features specialized in extreme class detection
+        - 'all_results': Complete analysis results for all features
+    """
+    results = diagnose_imbalanced_features(X, y)
+    
+    print("\n" + "=" * 100)
+    print("FEATURE GROUPS:\n")
+    
+    tier1 = [r for r in results if r['pairwise_sep'] > 0.45]
+    print(f"TIER 1 - Strong (PairSep > 0.45): {len(tier1)} features")
+    print(f"Features: {[r['feature'] for r in tier1]}")
+    
+    tier2 = [r for r in results if 0.25 <= r['pairwise_sep'] <= 0.45]
+    print(f"TIER 2 - Moderate (0.25-0.45): {len(tier2)} features")
+    print(f"Features: {[r['feature'] for r in tier2]}")
+    
+    tier3 = [r for r in results if 0.10 <= r['pairwise_sep'] < 0.25]
+    print(f"TIER 3 - Weak (0.10-0.25): {len(tier3)} features")
+    print(f"Features: {[r['feature'] for r in tier3]}")
+    
+    tier4 = [r for r in results if r['pairwise_sep'] < 0.10]
+    print(f"TIER 4 - Very Weak (< 0.10): {len(tier4)} features")
+    
+    extreme_specialists = [r for r in results 
+                          if r['extreme_auc'] > 0.70 and r['pairwise_sep'] > 0.30]
+    print(f"EXTREME CLASS SPECIALISTS (ExtAUC>0.70 & PairSep>0.30): {len(extreme_specialists)}")
+    print(f"Features: {[r['feature'] for r in extreme_specialists]}")
+    print(f"→ Critical for recognizing rare classes 0 and 4!\n")
+    print("=" * 100)
+    
+    return {
+        'tier1': tier1,
+        'tier2': tier2,
+        'tier3': tier3,
+        'tier4': tier4,
+        'extreme_specialists': extreme_specialists,
+        'all_results': results
+    }
 
 
 def plot_correlation_heatmap(
@@ -489,7 +776,7 @@ def compute_data_quality_metrics(
                 'missing_count': missing_count,
                 'missing_pct': missing_pct,
                 'unique_count': data.nunique(),
-                'unique_pct': (data.nunique() / len(data)) * 100 if len(data) > 0 else 0
+                'unique_pct': (data.nunique() / len(data)) * 100 if len(data) > 0 else 0,
             })
     
     return pd.DataFrame(metrics)

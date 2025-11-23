@@ -1,25 +1,10 @@
-"""Training utilities for model fitting, evaluation and early stopping.
-
-This module provides lightweight helpers used during model training:
-
-- MetricsCollection: Wraps torchmetrics metric objects and accumulates metric
-  state and loss across multiple batches.
-- EarlyStopping: Monitors a single metric and signals when training should stop
-  after a configurable patience without improvement.
-- Trainer: High-level orchestrator that runs training and validation loops,
-  logs metrics and supports optional early stopping and final test evaluation.
-
-Example:
-    trainer = Trainer(model, optimizer, loss_fn, device)
-    trainer.train(num_epochs, train_loader, val_loader, metrics={...})
-"""
-
 import os
 import logging
 from tqdm.auto import tqdm
 from pathlib import Path
-from copy import deepcopy
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Optional, Union
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 import torch
 import torch.nn as nn
@@ -28,177 +13,13 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import _LRScheduler, LinearLR, SequentialLR, ReduceLROnPlateau
-from torchmetrics.classification.base import _ClassificationTaskWrapper
+
+from .utils import MetricsCollection, EarlyStopping
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-class MetricsCollection:
-    """Collects and computes evaluation metrics and aggregated loss for a model over multiple batches.
-
-    This collector wraps a list of torchmetrics metric objects and accumulates their
-    state across calls to ``step``. It also accumulates the scalar loss value so that
-    the average or total loss can be reported alongside computed metrics.
-    """
-
-    def __init__(self, metrics: Dict[str, _ClassificationTaskWrapper], device: torch.device, log_folder: Optional[str] = None):
-        """Create a MetricsCollection.
-
-        Args:
-            metrics: A dictionary mapping metric names to instantiated torchmetrics metric objects.
-            device: Device to move metric states and computations to.
-        """
-        self._device = device
-        self._metrics = {name: metric.to(device) for name, metric in deepcopy(metrics).items()}
-        self._memory: Dict[str, List[float]] = self._init_memory()
-        self._temp_memory: Dict[str, List[float]] = self._init_memory()
-        self._steps: int = 0
-
-    def _init_memory(self) -> Dict[str, List[float]]:
-        memory = {name: [] for name in self._metrics.keys()}
-        memory["loss"] = []
-        return memory
-
-    def compute_metrics(self) -> Dict[str, float]:
-        """Compute and return all metrics and the accumulated loss.
-
-        Returns:
-            A dictionary mapping metric names to scalar values and including the key
-            ``"loss"`` for the current accumulated loss.
-        """
-        result = {}
-        for name, steps in self._temp_memory.items():
-            if name == "loss":
-                result["loss"] = sum(steps) / self._steps
-            else:
-                final_val = self._metrics[name].compute()
-                result[name] = float(final_val.item())
-        return result
-
-    def step(self, outputs: torch.Tensor, targets: torch.Tensor, loss: torch.Tensor) -> Dict[str, float]:
-        """Update internal metric state with a new batch and accumulate loss.
-
-        Args:
-            outputs: Model outputs for the current batch.
-            targets: Ground-truth targets for the current batch.
-            loss: Computed loss tensor for the current batch; its scalar value will be accumulated.
-
-        Returns:
-            A dictionary mapping metric names to their computed values for the current batch,
-            including the key ``"loss"`` for the current batch loss.
-        """
-        result = {}
-        for name, metric in self._metrics.items():
-            val = float(metric(outputs, targets).item())
-            self._temp_memory[name].append(val)
-            self._memory[name].append(val)
-            result[name] = val
-
-        loss_ = float(loss.item())
-        self._temp_memory["loss"].append(loss_)
-        self._memory["loss"].append(loss_)
-        result["loss"] = loss_
-
-        self._steps += 1
-        return result
-
-    def reset(self) -> None:
-        """Reset recorded per-step history and cached computations."""
-        for metric in self._metrics.values():
-            metric.reset()
-        self._temp_memory = self._init_memory()
-        self._steps = 0
-
-    def get_step_records(self, step: int) -> Dict[str, float]:
-        """Return recorded metric/loss values for a specific step index."""
-        if step >= self._steps:
-            raise IndexError(f"Step index {step} is out of bounds for recorded steps ({-self._steps} to {self._steps - 1})")
-        return {name: self._temp_memory[name][step] for name in self._temp_memory.keys()}
-
-    def get_all_saved_records(self) -> Dict[str, List[float]]:
-        """Return all persisted recorded metric/loss values across resets."""
-        return self._memory
-
-    def format_metrics_to_string(self) -> str:
-        """Format computed metrics into a human-readable single-line string for logging.
-
-        The formatting produces ``name: value`` pairs separated by ``|`` and rounds
-        numeric values to four decimal places. Lists or tuples are formatted as
-        comma-separated numeric entries with the same precision.
-
-        Returns:
-            A formatted string suitable for inclusion in logs.
-        """
-        metrics = self.compute_metrics()
-        metrics_log = ""
-        for key in sorted(metrics.keys()):
-            value = metrics[key]
-            if isinstance(value, (list, tuple)):
-                metrics_log += f"{key}: " + ", ".join([f"{v:.4f}" for v in value]) + " | "
-            else:
-                metrics_log += f"{key}: {value:.4f} | "
-        return metrics_log[:-3]  # Remove last ' | '
-
-
-class EarlyStopping:
-    """Simple early stopping helper that monitors a single metric and signals when training should stop.
-
-    The monitor name is expected to match a key returned by a MetricsEvaluator's
-    ``compute_metrics`` result. The stopping decision is based on the absence of
-    improvement for ``patience`` consecutive checks.
-    """
-
-    def __init__(
-        self,
-        monitor: str = 'loss',
-        patience: int = 3,
-        mode: Literal["min", "max"] = "min",
-        min_delta: float = 0.0
-    ):
-        """Initialize an EarlyStopping instance.
-
-        Args:
-            monitor: Name of the metric to watch (must match keys from MetricsEvaluator).
-            patience: Number of consecutive non-improving checks before signaling stop.
-            mode: Whether lower ("min") or higher ("max") values indicate improvement.
-            min_delta: Minimum change in the monitored metric to qualify as an improvement.
-        """
-        self.monitor = monitor
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.best = float('inf') if self.mode == 'min' else -float('inf')
-        self.num_bad_epochs = 0
-
-    def step(self, value: float) -> bool:
-        """Advance the early stopping state with the latest monitored value.
-
-        Args:
-            value: Latest value of the monitored metric.
-
-        Returns:
-            True if the number of consecutive non-improving checks has reached
-            or exceeded ``patience`` (i.e. training should stop), otherwise False.
-        """
-        if not isinstance(value, float):
-            raise TypeError(f"Monitored metric '{self.monitor}' should be a float, got {type(value)}")
-        
-        if self.mode == 'min':
-            improved = value < (self.best - self.min_delta)
-        else:
-            improved = value > (self.best + self.min_delta)
-
-        if improved:
-            self.best = value
-            self.num_bad_epochs = 0
-            return False
-        else:
-            self.num_bad_epochs += 1
-            return self.num_bad_epochs >= self.patience
-
-
-# warmup, cosine annealing
 class Trainer:
     """High-level training orchestrator that handles epochs, evaluation and optional early stopping.
 
@@ -238,7 +59,8 @@ class Trainer:
             writer: Optional externally-created SummaryWriter instance to use.
             scheduler: Optional ready-to-use PyTorch LR scheduler (any subclass of _LRScheduler).
             warmup_steps: Number of initial steps (batches or epochs depending on stepping mode) to linearly warm up the LR.
-            step_scheduler_every_batch: Whether to call scheduler.step() after every optimizer update (per-batch). If False, scheduler.step() is called once per epoch.
+            step_scheduler_every_batch: Whether to call scheduler.step() after every optimizer update (per-batch). 
+                If False, scheduler.step() is called once per epoch.
         """
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -264,6 +86,12 @@ class Trainer:
             self.writer = writer if writer is not None else SummaryWriter(str(self.TENSORBOARD_FOLDER / experiment_name))
         else:
             self.writer = None
+
+        # Initialize global step for per-batch TensorBoard logging
+        self.global_step = 0
+
+        # Gradient norm tracking
+        self.avg_grad_norm = 0.0
 
         # Scheduler / warmup settings
         self.step_scheduler_every_batch = step_scheduler_every_batch
@@ -321,8 +149,9 @@ class Trainer:
         test_loader: Optional[DataLoader] = None,
         metrics: Dict[str, Any] = {},
         early_stopping: Optional[Dict[str, Any]] = None,
-        log_graph: bool = False
-    ):
+        log_graph: bool = False,
+        is_calc_gradient: bool = True,
+    ) -> Dict[str, Dict[str, Any]]:
         """Run the training loop with validation, logging and optional early stopping.
 
         Args:
@@ -334,6 +163,7 @@ class Trainer:
             early_stopping: Optional mapping used to construct an EarlyStopping instance
                 (e.g. {"monitor": "loss", "patience": 3}). If omitted, early stopping is disabled.
             log_graph: Optional flag to log the model graph to TensorBoard once before training.
+            is_calc_gradient: Optional flag to calculate and print gradient norms during training.
 
         Returns:
             A dictionary with training, validation and test metrics records.
@@ -350,8 +180,8 @@ class Trainer:
             train_metrics.reset()
             val_metrics.reset()
 
-            self._train(train_loader, train_metrics)
-            self._test(val_loader, val_metrics)
+            self._train(train_loader, train_metrics, is_calc_gradient)
+            self._test(val_loader, val_metrics, phase="val")
             self.log(epoch, train_metrics, val_metrics)
 
             self._step_scheduler_epoch(val_metrics)
@@ -367,13 +197,14 @@ class Trainer:
         test_metrics = None
         if test_loader:
             test_metrics = MetricsCollection(metrics, self.device)
-            self._test(test_loader, test_metrics)
+            self._test(test_loader, test_metrics, phase="test")
             logger.info(f"Test Metrics: {test_metrics.format_metrics_to_string()}")
 
             if self.writer is not None:
                 test_results = test_metrics.compute_metrics()
                 for key, val in test_results.items():
-                    self.writer.add_scalar(f"test/{key}", val, num_epochs)
+                    if isinstance(val, (int, float)):
+                        self.writer.add_scalar(f"test/{key}", val, num_epochs)
 
         if self.writer is not None:
             self.writer.flush()
@@ -384,7 +215,6 @@ class Trainer:
             "val": self._create_output_dict(val_metrics),
             "test": self._create_output_dict(test_metrics) if test_metrics else None,
         }
-
 
     def _step_scheduler_epoch(self, val_metrics: MetricsCollection) -> None:
         """Perform scheduler stepping at the end of an epoch if configured.
@@ -435,15 +265,17 @@ class Trainer:
         val_results = val_metrics.compute_metrics()
         step = epoch + 1
         for key, val in train_results.items():
-            self.writer.add_scalar(f"train/{key}", val, step)
+            if isinstance(val, (int, float)):
+                self.writer.add_scalar(f"train/{key}", val, step)
         for key, val in val_results.items():
-            self.writer.add_scalar(f"val/{key}", val, step)
+            if isinstance(val, (int, float)):
+                self.writer.add_scalar(f"val/{key}", val, step)
 
         # log LR
         try:
             lr = self.optimizer.param_groups[0].get("lr", None)
             if lr is not None:
-                self.writer.add_scalar("lr", lr, step)
+                self.writer.add_scalar("lr/epoch", lr, step)
         except Exception as e:
             logger.warning(f"Failed to log LR: {e}")
 
@@ -486,15 +318,21 @@ class Trainer:
             result[name] = {"steps": vals, "final": metrics[name]}
         return result
 
-    def _train(self, train_loader: DataLoader, metrics: MetricsCollection) -> None:
+    def _train(self, train_loader: DataLoader, metrics: MetricsCollection, is_calc_gradients: bool) -> None:
         """Perform a single training epoch over the provided DataLoader.
 
         Args:
             train_loader: DataLoader yielding training batches.
             metrics_eval: MetricsEvaluator instance used to update and accumulate metrics.
+            is_calc_gradients: Optional flag to calculate and print gradient norms during training.
         """
+        acc_h_arr = []
+        total_norm = 0.0
+        batch_grad_norm = 0.0
+        num_batches = 0
         self.model.train()
-        for batch in tqdm(train_loader, desc="Train", unit="batch", total=len(train_loader)):
+        pbar = tqdm(train_loader, desc="Train", unit="batch", total=len(train_loader))
+        for batch in pbar:
             x_batch = self._to_device(batch[0])
             y_batch = self._to_device(batch[1])
 
@@ -506,11 +344,22 @@ class Trainer:
                         outputs = self.model(*x_batch)
                     else:
                         outputs = self.model(x_batch)
-                    loss = self.loss_fn(outputs.squeeze(-1), y_batch)
+                    loss = self.loss_fn(outputs, y_batch)
+
                 self.scaler.scale(loss).backward()
-                metrics.step(outputs.squeeze(-1), y_batch, loss)
+                self.scaler.unscale_(self.optimizer)
+
+                if is_calc_gradients:
+                    batch_grad_norm = self._calc_gradients()
+                    total_norm += batch_grad_norm
+                    num_batches += 1
+
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+
+                metrics.step(self._ordinal_to_class(outputs), y_batch, loss)
 
                 # scheduler step per-batch (if configured)
                 if self.scheduler is not None and self.step_scheduler_every_batch:
@@ -520,43 +369,109 @@ class Trainer:
                     outputs = self.model(*x_batch)
                 else:
                     outputs = self.model(x_batch)
-                loss = self.loss_fn(outputs.squeeze(-1), y_batch)
+                loss = self.loss_fn(outputs, y_batch)
+
                 loss.backward()
-                metrics.step(outputs.squeeze(-1), y_batch, loss)
+
+                if is_calc_gradients:
+                    batch_grad_norm = self._calc_gradients()
+                    total_norm += batch_grad_norm
+                    num_batches += 1
+
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
+
+                metrics.step(self._ordinal_to_class(outputs), y_batch, loss)
 
                 # scheduler step per-batch (if configured)
                 if self.scheduler is not None and self.step_scheduler_every_batch:
                     self.scheduler.step()
 
-    def _test(self, test_loader: DataLoader, metrics: MetricsCollection) -> None:
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "grad_norm": f"{batch_grad_norm:.4f}"})
+
+            B, C, K = outputs.shape
+            batch_acc_h = []
+            for k in range(K):
+                preds_k = self._ordinal_to_class(outputs[:, :, k])      # (B,)
+                target_k = y_batch[:, k]                           # (B,)
+                acc_k = (preds_k == target_k).float().mean()       # scalar
+                batch_acc_h.append(acc_k)
+            acc_h_arr.append(torch.stack(batch_acc_h))  # (K,)
+
+            if self.writer is not None:
+                try:
+                    loss_val = float(loss.item())
+                    self.writer.add_scalar("train/loss", loss_val, self.global_step)
+                    lr = self.optimizer.param_groups[0].get("lr", None)
+                    if lr is not None:
+                        self.writer.add_scalar("lr/batch", lr, self.global_step)
+                except Exception as e:
+                    logger.warning(f"Failed to log batch scalars to TensorBoard: {e}")
+                finally:
+                    self.global_step += 1
+
+        acc_h = torch.stack(acc_h_arr, dim=0).mean(dim=0)  # (K,)
+        print(*acc_h.tolist(), float(acc_h.mean().item()))
+        self.avg_grad_norm = total_norm / num_batches if num_batches > 0 else 0.0
+
+    def _calc_gradients(self) -> float:
+        total_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        return total_norm
+
+    def _test(self, test_loader: DataLoader, metrics: MetricsCollection, phase: str = "val") -> None:
         """Evaluate the model on data from ``test_loader`` without updating parameters.
 
         Args:
             test_loader: DataLoader yielding evaluation batches.
             metrics_eval: MetricsEvaluator used to accumulate metrics for the evaluation set.
+            phase: Name of the phase used for TensorBoard logging (e.g. 'val' or 'test').
         """
+        acc_h_arr = []
         self.model.eval()
         with torch.no_grad():
             for batch in tqdm(test_loader, desc="Test", unit="batch", total=len(test_loader)):
                 x_batch = self._to_device(batch[0])
                 y_batch = self._to_device(batch[1])
                 if self.use_amp:
-                    with autocast():
+                    with autocast(device_type="cuda"):
                         if isinstance(x_batch, list):
                             outputs = self.model(*x_batch)
                         else:
                             outputs = self.model(x_batch)
-                        outputs = outputs.squeeze(-1)
                         loss = self.loss_fn(outputs, y_batch)
                 else:
                     if isinstance(x_batch, list):
                         outputs = self.model(*x_batch)
                     else:
                         outputs = self.model(x_batch)
-                    outputs = outputs.squeeze(-1)
                     loss = self.loss_fn(outputs, y_batch)
-                metrics.step(outputs, y_batch, loss)
+                metrics.step(self._ordinal_to_class(outputs), y_batch, loss)
+
+                B, C, K = outputs.shape
+                batch_acc_h = []
+                for k in range(K):
+                    preds_k = self._ordinal_to_class(outputs[:, :, k])      # (B,)
+                    target_k = y_batch[:, k]                           # (B,)
+                    acc_k = (preds_k == target_k).float().mean()       # scalar
+                    batch_acc_h.append(acc_k)
+                acc_h_arr.append(torch.stack(batch_acc_h))  # (K,)
+
+                if self.writer is not None:
+                    try:
+                        loss_val = float(loss.item())
+                        self.writer.add_scalar(f"{phase}/loss", loss_val, self.global_step)
+                    except Exception as e:
+                        logger.warning(f"Failed to log batch scalars to TensorBoard: {e}")
+                    finally:
+                        self.global_step += 1
+
+            acc_h = torch.stack(acc_h_arr, dim=0).mean(dim=0)  # (K,)
+            print(*acc_h.tolist(), float(acc_h.mean().item()))
 
     def _to_device(
         self, 
@@ -580,6 +495,17 @@ class Trainer:
             val_metrics_eval: MetricsEvaluator with accumulated validation metrics.
         """
         log_msg = f"Epoch {epoch+1}:\n"
+        if self.avg_grad_norm > 0.0:
+            log_msg += f"Avg Grad Norm: {self.avg_grad_norm:.4f}\n"
         log_msg += f"Train Metrics: {train_metrics_eval.format_metrics_to_string()}\n"
         log_msg += f"Val Metrics:   {val_metrics_eval.format_metrics_to_string()}\n"
         logger.info(log_msg)
+
+    def _ordinal_to_class(self, logits: torch.Tensor, thresh: float = 0.5) -> torch.Tensor:
+        """Convert ordinal logits to class predictions
+
+        The conversion applies a sigmoid activation to the logits and
+        counts the number of thresholds exceeded to determine the class.
+        """
+        # logits: [B, 4, K] -> classes [B, K] through sigmoids
+        return (torch.sigmoid(logits) > thresh).sum(dim=1).long()

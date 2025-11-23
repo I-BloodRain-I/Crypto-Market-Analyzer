@@ -1,16 +1,14 @@
-import os
-from typing import Union, List, Optional
+from typing import List, Optional, Union
 
 import torch
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
+import pandas as pd
 from torch.utils.data import Dataset
 
 
 class MultiHorizonDataset(Dataset):
     """
-    Fast multi-horizon dataset backed by PyArrow parquet.
+    Fast multi-horizon dataset backed by pandas DataFrames or NumPy arrays.
 
     Returns items compatible with MultiHorizonTransformer:
         - past_feats: torch.Tensor shaped [L, F_p]
@@ -19,90 +17,70 @@ class MultiHorizonDataset(Dataset):
         - target: torch.Tensor shaped [H] or [H, num_targets]
 
     Args:
-        parquet_path: Path to parquet files.
+        past_features: DataFrame or 2D array with past (historical) features.
+        future_features: DataFrame or 2D array with future (known) features.
+        targets: DataFrame or 2D array with target variables.
         context_len: Historical context length (L).
         max_horizon: Prediction horizon length (H).
-        target_horizons: List of target horizons to predict (optional).
-        past_feature_indices: List of column indices or names to use as past features.
-        future_feature_indices: List of column indices or names to use as future (known) features.
+        target_horizons: List of target horizons to predict.
         stride: Stride between windows.
-        static_feature_indices: List of column indices or names to use as static features (optional).
-        target: Column name, column index, or list of names/indices for target(s).
+        static_features: DataFrame or 2D array with static features (optional).
     """
     def __init__(
         self,
-        parquet_path: str,
+        past_features: Union[pd.DataFrame, np.ndarray],
+        future_features: Union[pd.DataFrame, np.ndarray],
+        targets: Union[pd.DataFrame, np.ndarray],
         context_len: int,
         max_horizon: int,
         target_horizons: List[int],
-        past_feature_indices: Optional[List[Union[int, str]]],
-        future_feature_indices: Optional[List[Union[int, str]]],
         stride: int = 1,
-        static_feature_indices: Optional[List[Union[int, str]]] = None,
-        target: Union[int, str, List[Union[int, str]]] = -1,
+        static_features: Optional[Union[pd.DataFrame, np.ndarray]] = None,
     ):
         self.context_len = context_len
         self.max_horizon = max_horizon
-        self.target_horizons = torch.tensor([th-1 for th in target_horizons]) if target_horizons is not None else None
+        self.target_horizons = torch.tensor([th-1 for th in target_horizons])
         self.stride = stride
 
-        files = sorted([os.path.join(parquet_path, f) for f in os.listdir(parquet_path) if f.endswith(".parquet")])
-        tables = [pq.read_table(f) for f in files]
-        # self.table = pa.concat_tables(tables)
-        self.table = pa.Table.from_pandas(pa.concat_tables(tables).to_pandas().iloc[-1000:])
-        self.total_rows = len(self.table)
+        self.total_rows = len(past_features)
+        
+        if len(future_features) != self.total_rows:
+            raise ValueError("past_features and future_features must have the same length")
+        if len(targets) != self.total_rows:
+            raise ValueError("past_features and targets must have the same length")
+        if static_features is not None and len(static_features) != self.total_rows:
+            raise ValueError("past_features and static_features must have the same length")
 
-        names = list(self.table.schema.names)
-
-        def resolve_cols(cols):
-            if cols is None:
-                return None
-            if isinstance(cols, list):
-                resolved = []
-                for c in cols:
-                    if isinstance(c, int):
-                        resolved.append(names[c])
-                    else:
-                        resolved.append(str(c))
-                return resolved
-            if isinstance(cols, int):
-                return [names[cols]]
-            return [str(cols)]
-
-        self.past_feature_names = resolve_cols(past_feature_indices) or names
-        self.future_feature_names = resolve_cols(future_feature_indices) or [names[i] for i in (0, 1, 2) if i < len(names)]
-        self.static_feature_names = resolve_cols(static_feature_indices)
-        self.target_names = resolve_cols(target)
-
-        self.past_arrays = [
-            self.table.column(name).to_numpy()
-            for name in self.past_feature_names
-        ]
-        self.future_arrays = [
-            self.table.column(name).to_numpy()
-            for name in self.future_feature_names
-        ]
-        if self.static_feature_names is not None:
-            self.static_arrays = [
-                self.table.column(name).to_numpy()
-                for name in self.static_feature_names
-            ]
+        self.past_arrays = self._to_column_arrays(past_features)
+        self.future_arrays = self._to_column_arrays(future_features)
+        self.target_arrays = self._to_column_arrays(targets)
+        
+        if static_features is not None:
+            self.static_arrays = self._to_column_arrays(static_features)
         else:
             self.static_arrays = None
 
-        # target can be one or multiple columns
-        if self.target_names is None:
-            raise ValueError("target must be provided as column name/index or list thereof")
-        self.target_arrays = [
-            self.table.column(name).to_numpy()
-            for name in self.target_names
-        ]
+        if len(self.target_arrays) != len(self.target_horizons):
+            raise ValueError("Number of target columns must equal number of target_horizons")
 
         max_start = self.total_rows - (self.context_len + self.max_horizon)
         if max_start < 0:
             self.num_windows = 0
         else:
             self.num_windows = max_start // self.stride + 1
+
+    def _to_column_arrays(self, data: Union[pd.DataFrame, np.ndarray]) -> List[np.ndarray]:
+        if isinstance(data, pd.DataFrame):
+            return [data[col].values for col in data.columns]
+        elif isinstance(data, np.ndarray):
+            if data.ndim == 1:
+                return [data]
+            elif data.ndim == 2:
+                return [data[:, i] for i in range(data.shape[1])]
+            else:
+                raise ValueError(f"NumPy array must be 1D or 2D, got {data.ndim}D")
+        else:
+            raise TypeError(f"Expected pd.DataFrame or np.ndarray, got {type(data)}")
 
     def __len__(self):
         return self.num_windows
@@ -124,10 +102,6 @@ class MultiHorizonDataset(Dataset):
             for arr in self.future_arrays
         ]).astype(np.float32)
 
-        if self.target_horizons is None:
-            raise ValueError("target_horizons must be provided for per-column-per-horizon mode")
-        if len(self.target_arrays) != len(self.target_horizons):
-            raise ValueError("When using per-column-per-horizon mode, number of target columns must equal number of target_horizons")
         horizons = self.target_horizons.tolist()
         target = np.array([
             arr[future_start + int(h)]

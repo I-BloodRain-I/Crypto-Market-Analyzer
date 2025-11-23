@@ -2,9 +2,9 @@
 Download Binance futures data .zip files by date range.
 
 Usage examples:
-    python data_downloader.py --start 01-01-2023 --end 05-01-2023
+    python data_downloader.py --start 01-01-2023 --end 05-01-2023 --endpoint klines
     python data_downloader.py --symbol BTCUSDT --interval 1m --start 01-01-2023 --end 05-01-2023 \
-        --workers 4 --retries 5 --timeout 10 --dest data/downloaded --overwrite
+        --workers 4 --endpoint klines --retries 5 --timeout 10 --dest data/downloaded --overwrite
 
 Arguments:
     --symbol    Trading pair symbol (default: BTCUSDT)
@@ -14,6 +14,7 @@ Arguments:
     --dest      Destination folder to save zips (default: data/downloaded)
     --retries   Number of request retries (default: 5)
     --timeout   Per-request timeout in seconds (default: 10.0)
+    --endpoint  API endpoint to download from, e.g. klines or bookDepth (required)
     --overwrite Overwrite existing files (flag)
     --workers   Number of download threads to use (default: 4; 1 = sequential)
 """
@@ -262,7 +263,6 @@ if __name__ == "__main__":
 
     try:
         dest = Path(args.dest)
-        # For multithreaded runs we let each worker create its own session
         session: Optional[requests.Session]
         if args.workers and args.workers > 1:
             session = None

@@ -56,13 +56,6 @@ class OrderbookNormalizer(BaseEstimator, TransformerMixin):
         # Will be set in fit() for compatibility with get_feature_names_out
         self._feature_names_out: Optional[List[str]] = None
 
-        self._drop_columns: List[str] = [center_col]
-        self._drop_columns.extend(
-            [f"{self.depth_prefix}_{i}" for i in self.levels])
-        self._drop_columns.extend(
-            [f"{self.notional_prefix}_{i}" for i in self.levels]
-        )
-
     def fit(self, X: pd.DataFrame, y=None):
         """Validate input columns and compute output feature names.
 

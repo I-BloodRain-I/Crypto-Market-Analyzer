@@ -1,11 +1,12 @@
-"""Helpers for threshold-quality checks for 5-class labeling.
+"""Helpers for threshold-quality checks for multi-class labeling.
 
 Provides independent, testable functions that evaluate properties such as
 separation, overlap, threshold stability, purity versus thresholds,
 monotonicity, extremes metrics, noise level, and per-class statistics.
 
 Each function accepts pandas Series and returns scalars or small dicts
-suitable for unit tests and diagnostic reporting.
+suitable for unit tests and diagnostic reporting. Works with any number
+of label classes (e.g., 3, 5, 11, etc.).
 """
 from typing import Dict, Tuple, Union
 
@@ -70,10 +71,9 @@ def overlap_score(series_returns: pd.Series, series_labels: pd.Series, overlap_t
     Returns:
         Overlap score in [0,1] or nan if not enough class pairs.
     """
-    classes = [-2, -1, 0, 1, 2]
+    present = sorted(series_labels.unique())
     overlap_accum = 0.0
     pair_count = 0
-    present = [c for c in classes if (series_labels == c).any()]
     for i, class1 in enumerate(present):
         returns_class1 = series_returns[series_labels == class1]
         if returns_class1.empty:
@@ -106,10 +106,17 @@ def purity_vs_thresholds(
         t1_down_series: t1 down series (aligned to returns index)
 
     Returns:
-        (purity_up, purity_down) where each is fraction of +2/-2 satisfying threshold.
+        (purity_up, purity_down) where each is fraction of max/min label satisfying threshold.
     """
-    idx_up = series_labels.index[series_labels == 2]
-    idx_down = series_labels.index[series_labels == -2]
+    present_classes = sorted(series_labels.unique())
+    if len(present_classes) == 0:
+        return 0.0, 0.0
+    
+    max_class = present_classes[-1]
+    min_class = present_classes[0]
+    
+    idx_up = series_labels.index[series_labels == max_class]
+    idx_down = series_labels.index[series_labels == min_class]
     if len(idx_up) > 0:
         try:
             purity_up = float((series_returns.loc[idx_up] >= t1_up_series.loc[idx_up]).mean())
@@ -132,7 +139,7 @@ def purity_vs_thresholds(
 
 
 def separation_ratio(series_returns: pd.Series, series_labels: pd.Series) -> float:
-    """Separation ratio between -2 and +2 using pooled std.
+    """Separation ratio between extreme classes (min and max) using pooled std.
 
     Args:
         series_returns: returns series
@@ -141,11 +148,21 @@ def separation_ratio(series_returns: pd.Series, series_labels: pd.Series) -> flo
     Returns:
         Separation ratio or nan if insufficient samples.
     """
-    returns_m2, returns_p2 = series_returns[series_labels == -2], series_returns[series_labels == 2]
-    if len(returns_m2) > 1 and len(returns_p2) > 1:
-        std_m2, std_p2 = returns_m2.std(ddof=1), returns_p2.std(ddof=1)
-        pooled_std_ext = np.sqrt((std_m2 ** 2 + std_p2 ** 2) / 2.0)
-        return (returns_p2.mean() - returns_m2.mean()) / pooled_std_ext if pooled_std_ext != 0 else np.nan
+    present_classes = sorted(series_labels.unique())
+    if len(present_classes) < 2:
+        return np.nan
+    
+    min_class = present_classes[0]
+    max_class = present_classes[-1]
+    
+    returns_min = series_returns[series_labels == min_class]
+    returns_max = series_returns[series_labels == max_class]
+    
+    if len(returns_min) > 1 and len(returns_max) > 1:
+        std_min = returns_min.std(ddof=1)
+        std_max = returns_max.std(ddof=1)
+        pooled_std_ext = np.sqrt((std_min ** 2 + std_max ** 2) / 2.0)
+        return (returns_max.mean() - returns_min.mean()) / pooled_std_ext if pooled_std_ext != 0 else np.nan
     return np.nan
 
 
@@ -159,17 +176,15 @@ def monotonicity_test(series_returns: pd.Series, series_labels: pd.Series) -> bo
     Returns:
         True if means are strictly increasing across present classes.
     """
-    classes = [-2, -1, 0, 1, 2]
     class_means = series_returns.groupby(series_labels).mean()
-    means_present = class_means.dropna()
-    means_present = means_present.loc[[c for c in classes if c in means_present.index]]
+    means_present = class_means.dropna().sort_index()
     if len(means_present) < 2 or means_present.isna().any():
         return False
     return all(means_present.iloc[i] < means_present.iloc[i + 1] for i in range(len(means_present) - 1))
 
 
 def extremes_metrics(series_returns: pd.Series, series_labels: pd.Series, extreme_q: float = 0.99) -> Dict[str, float]:
-    """Compute precision and recall for extreme (+2/-2) classes.
+    """Compute precision and recall for extreme (min/max) classes.
 
     Args:
         series_returns: returns series
@@ -179,20 +194,32 @@ def extremes_metrics(series_returns: pd.Series, series_labels: pd.Series, extrem
     Returns:
         Dict with keys: extreme_precision_up, extreme_precision_down, extreme_recall_up, extreme_recall_down
     """
+    present_classes = sorted(series_labels.unique())
+    if len(present_classes) == 0:
+        return {
+            'extreme_precision_up': 0.0,
+            'extreme_precision_down': 0.0,
+            'extreme_recall_up': np.nan,
+            'extreme_recall_down': np.nan,
+        }
+    
+    max_class = present_classes[-1]
+    min_class = present_classes[0]
+    
     q_hi = series_returns.quantile(extreme_q)
     q_lo = series_returns.quantile(1 - extreme_q)
     mask_hi = series_returns >= q_hi
     mask_lo = series_returns <= q_lo
-    if (series_labels == 2).any():
-        extreme_precision_up = float((series_returns[series_labels == 2] >= q_hi).mean())
+    if (series_labels == max_class).any():
+        extreme_precision_up = float((series_returns[series_labels == max_class] >= q_hi).mean())
     else:
         extreme_precision_up = 0.0
-    if (series_labels == -2).any():
-        extreme_precision_down = float((series_returns[series_labels == -2] <= q_lo).mean())
+    if (series_labels == min_class).any():
+        extreme_precision_down = float((series_returns[series_labels == min_class] <= q_lo).mean())
     else:
         extreme_precision_down = 0.0
-    extreme_recall_up = float((series_labels[mask_hi] == 2).mean()) if mask_hi.any() else np.nan
-    extreme_recall_down = float((series_labels[mask_lo] == -2).mean()) if mask_lo.any() else np.nan
+    extreme_recall_up = float((series_labels[mask_hi] == max_class).mean()) if mask_hi.any() else np.nan
+    extreme_recall_down = float((series_labels[mask_lo] == min_class).mean()) if mask_lo.any() else np.nan
     return {
         'extreme_precision_up': extreme_precision_up,
         'extreme_precision_down': extreme_precision_down,
@@ -209,9 +236,11 @@ def noise_ratio(series_returns: pd.Series, series_labels: pd.Series) -> float:
         series_labels: integer label series
 
     Returns:
-        noise ratio or nan when insufficient data.
+        noise ratio or nan when insufficient data or no neutral class (0).
     """
     std_all = series_returns.std(ddof=1)
+    if 0 not in series_labels.values:
+        return np.nan
     neutral_returns = series_returns[series_labels == 0]
     if std_all and len(neutral_returns) > 1:
         return float(neutral_returns.std(ddof=1) / std_all)
@@ -228,10 +257,10 @@ def class_stats(series_returns: pd.Series, series_labels: pd.Series) -> Dict[int
     Returns:
         Mapping class -> {'mean':..., 'std':..., 'count':...}
     """
-    classes = [-2, -1, 0, 1, 2]
+    present_classes = sorted(series_labels.unique())
     stats = {}
     total_n = len(series_labels)
-    for cls in classes:
+    for cls in present_classes:
         mask = series_labels == cls
         count = int(mask.sum())
         if count == 0:
@@ -255,7 +284,7 @@ def analyze_labels_quality(
     """Produce per-horizon diagnostics that quantify label quality.
 
     This function runs a set of independent checks on the provided
-    multi-horizon returns and corresponding 5-class labels and returns a
+    multi-horizon returns and corresponding multi-class labels and returns a
     dictionary of diagnostic metrics for each horizon. The checks are
     intentionally modular (separation, purity vs thresholds, overlap,
     monotonicity of class means, Cohen's d between adjacent classes,
@@ -265,8 +294,8 @@ def analyze_labels_quality(
     Args:
         returns_df: DataFrame of forward returns indexed by timestamp with
             one column per horizon.
-        labels_df: DataFrame of integer labels in {-2,-1,0,1,2} matching
-            `returns_df` columns and index.
+        labels_df: DataFrame of integer labels matching `returns_df` columns
+            and index. Can have any number of classes (e.g., 3, 5, 11).
         meta: Auxiliary information produced by the labeling pipeline
             (expected keys include 't1_up', 't1_down', 't2_up', 't2_down',
             'imbalance', 'density'). Per-horizon entries may be scalars
@@ -274,7 +303,7 @@ def analyze_labels_quality(
         overlap_trim_q: Quantile used to trim tails when computing the
             symmetric overlap score (robustness to outliers).
         extreme_q: Quantile used to define extreme returns for precision
-            / recall of ±2 labels.
+            / recall of extreme labels.
         cohens_d_min_samples: Minimum samples required to compute Cohen's d
             for an adjacent-class pair.
         stability_use_mad: When True, compute threshold CV using MAD-based
@@ -296,7 +325,7 @@ def analyze_labels_quality(
           When a per-timestamp Series is present it is reindexed to
           `returns_df.index`; if it contains only NaNs the scalar median
           is used as a fallback.
-        - Separation for extremes uses pooled std between -2 and +2 class
+        - Separation for extremes uses pooled std between min and max class
           returns. Overlap is symmetric and computed only across actually
           present class pairs.
         - The function is deterministic and side-effect free; it is safe
@@ -321,11 +350,11 @@ def analyze_labels_quality(
         r = returns_df[h]
         y = labels_df[h]
 
-        classes = [-2, -1, 0, 1, 2]
+        present_classes = sorted(y.unique())
         class_means = r.groupby(y).mean()
         class_stds = r.groupby(y).std(ddof=1)
-        cm = class_means.reindex(classes).astype(float)
-        cs = class_stds.reindex(classes).astype(float)
+        cm = class_means.reindex(present_classes).astype(float)
+        cs = class_stds.reindex(present_classes).astype(float)
 
         sep_ratio = separation_ratio(r, y)
 
@@ -339,7 +368,8 @@ def analyze_labels_quality(
         is_monotonic = monotonicity_test(r, y)
 
         cohens_map: Dict[str, float] = {}
-        for (c1, c2) in [(-2, -1), (-1, 0), (0, 1), (1, 2)]:
+        for i in range(len(present_classes) - 1):
+            c1, c2 = present_classes[i], present_classes[i + 1]
             dval = cohens_d(r[y == c1], r[y == c2], min_samples=cohens_d_min_samples)
             if not np.isnan(dval):
                 cohens_map[f'{c1}→{c2}'] = float(dval)
@@ -357,7 +387,6 @@ def analyze_labels_quality(
         extreme_recall_dn = extremes.get('extreme_recall_down', extremes.get('extreme_recall_dn', np.nan))
 
         total_n = len(y)
-        present = [c for c in classes if (y == c).any()]
 
         results[h] = {
             'separation': float(sep_ratio) if not np.isnan(sep_ratio) else np.nan,
@@ -376,7 +405,7 @@ def analyze_labels_quality(
             'extreme_recall_dn': float(extreme_recall_dn) if not np.isnan(extreme_recall_dn) else np.nan,
             'class_means': {int(k): (float(v) if not np.isnan(v) else np.nan) for k, v in cm.to_dict().items()},
             'class_stds': {int(k): (float(v) if not np.isnan(v) else np.nan) for k, v in cs.to_dict().items()},
-            'present_classes': present,
+            'present_classes': present_classes,
             'n_total': int(total_n),
         }
 

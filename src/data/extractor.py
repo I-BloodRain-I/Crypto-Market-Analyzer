@@ -240,6 +240,8 @@ class DataExtractor:
 		Accepts strings with format "%Y-%m-%d %H:%M:%S" and coerces invalid values.
 		"""
 		dt = pd.to_datetime(ts, format="%Y-%m-%d %H:%M:%S", errors="coerce", utc=True)
+		if pd.isna(dt).any():
+			return ts.astype("int64")
 		try:
 			ints = dt.astype('int64') // 10**6
 		except Exception:

@@ -14,11 +14,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import numpy as np
 import pandas as pd
+import cloudpickle as cp
 from numpy.typing import NDArray
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset, Sampler, Dataset
 
+from tech_analysis import *
 from .config import DataPipelineConfig
 from .pipeline_builder import PipelineBuilder
 from .label_generator import LabelGenerator
@@ -65,6 +67,9 @@ class DataProcessor:
         processed_array = pipeline.transform(df)
         processed_df = pd.DataFrame(processed_array, columns=pipeline.get_feature_names_out())
         processed_df[int_cols] = processed_df[int_cols].astype("int64")
+
+        if not np.isfinite(processed_array).all():
+            raise ValueError("Processed data contains NaN or infinite values.")
         return processed_df
 
     @staticmethod
@@ -107,9 +112,9 @@ class DataProcessor:
             y = np.asarray(y)
 
         if y is not None:
-            dataset = TensorDataset(torch.tensor(X, dtype=x_dtype), torch.tensor(y, dtype=y_dtype))
+            dataset = TensorDataset(torch.from_numpy(X).to(dtype=x_dtype), torch.from_numpy(y).to(dtype=y_dtype))
         else:
-            dataset = TensorDataset(torch.tensor(X, dtype=x_dtype))
+            dataset = TensorDataset(torch.from_numpy(X).to(dtype=x_dtype))
         return DataLoader(
             dataset, 
             batch_size=batch_size, 
@@ -132,18 +137,90 @@ class DataProcessor:
         return PipelineBuilder.build(config)
 
     @staticmethod
+    def save_pipeline(pipeline: Pipeline, path: Union[str, Path]) -> None:
+        """Save a fitted preprocessing pipeline to disk using joblib.
+
+        Args:
+            pipeline: The fitted sklearn Pipeline to save.
+            path: The file path to save the pipeline to.
+
+        """
+        with open(path, "wb") as f:
+            cp.dump(pipeline, f)
+
+    @staticmethod
+    def load_pipeline(path: Union[str, Path]) -> Pipeline:
+        """Load a fitted preprocessing pipeline from disk using joblib.
+
+        Args:
+            path: The file path to load the pipeline from.
+
+        Returns:
+            The loaded sklearn Pipeline instance.
+        """
+        with open(path, "rb") as f:
+            return cp.load(f)
+
+    @staticmethod
+    def add_technical_indicators(
+        df: pd.DataFrame,
+        indicators: List[Tuple[str, Dict[str, Union[int, float]]]],
+    ) -> pd.DataFrame:
+        """Add technical indicator columns to a DataFrame.
+
+        This method computes specified technical indicators (e.g., SMA, EMA)
+        over given arguments and appends them as new columns to the DataFrame.
+
+        Args:
+            df: Input DataFrame containing price data.
+            indicators: List of technical indicators with arguments to compute 
+                (e.g., [('SMA', {'window': 5}), ('ADX', {'adx_window': 10, 'di_window': 14})]).
+
+        Returns:
+            The input DataFrame augmented with new technical indicator columns.
+        """
+        dfs = [df]
+        for ind_name, params in indicators:
+            ind_name = ind_name.strip().lower()
+            if   ind_name == "sma":         dfs.append(calc_sma(df, **params))
+            elif ind_name == "ema":         dfs.append(calc_ema(df, **params))
+            elif ind_name == "adx":         dfs.append(calc_adx(df, **params))
+            elif ind_name == "macd":        dfs.append(calc_macd_diff(df, **params))
+            elif ind_name == "sar":         dfs.append(calc_sar(df, **params))
+            elif ind_name == "ichimoku":    dfs.append(calc_ichimoku(df, **params))
+            elif ind_name == "rsi":         dfs.append(calc_rsi(df, **params))
+            elif ind_name == "stoch":       dfs.append(calc_stoch(df, **params))
+            elif ind_name == "cci":         dfs.append(calc_cci(df, **params))
+            elif ind_name == "momentum":    dfs.append(calc_momentum(df, **params))
+            elif ind_name == "bbands":      dfs.append(calc_bollinger_bands(df, **params))
+            elif ind_name == "atr":         dfs.append(calc_atr(df, **params))
+            elif ind_name == "obv":         dfs.append(calc_obv(df))
+            elif ind_name == "vwap":        dfs.append(calc_vwap(df))
+            elif ind_name == "cmf":         dfs.append(calc_cmf(df, **params))
+            elif ind_name == "mfi":         dfs.append(calc_mfi(df, **params))
+            elif ind_name == "williams_r":  dfs.append(calc_williams_r(df, **params))
+            elif ind_name == "ao":          dfs.append(calc_awesome_oscillator(df, **params))
+            elif ind_name == "uo":          dfs.append(calc_ultimate_oscillator(df, **params))
+            elif ind_name == "stochrsi":    dfs.append(calc_stochrsi(df, **params))
+            elif ind_name == "fgi":         dfs.append(calc_fear_greed_index(df, **params))
+            elif ind_name == "bbp":         dfs.append(calc_bull_bear_power(df, **params))
+            elif ind_name == "fibonacci":   dfs.append(calc_fibonacci_retracement_levels(df, **params))
+        return pd.concat(dfs, axis=1)
+
+
+    @staticmethod
     def label_data(
         df: pd.DataFrame,
         horizons: List[int],
         *,
-        alpha: float = 1.0,
+        alpha: float = 1.05,
         k_imb: float = 0.3,
-        k_liq: float = 0.2,
-        gamma_strong: float = 2.0,
-        span_sig: int = 100,
+        k_liq: float = 0.1,
+        gamma_strong: float = 2.25,
+        span_sig: int = 350,
         band_cols: Tuple[int, ...] = (1, 2, 3, 4, 5),
         floor_bp: float = 2e-4,
-        roll_liq: int = 200
+        roll_liq: int = 400
     ) -> pd.DataFrame:
         """Generate multi-horizon labels and sample weights and attach them to the DataFrame.
 
@@ -199,9 +276,10 @@ class DataProcessor:
         if not (labels_5.shape[0] == sample_weights.shape[0] == df.shape[0]):
             raise ValueError("Mismatch in number of samples between labels, sample weights, and input data.")
 
+        labels_5 += 2
         max_horizon = labels_5.columns[-1]
         df[[f"horizon_{horizon}" for horizon in labels_5.columns]] = labels_5.values.astype(np.int64)
-        df["sample_weights"] = sample_weights.values
+        # df["sample_weights"] = sample_weights.values
         df = df.iloc[:-max_horizon]
 
         if df.isna().any().any():
@@ -213,11 +291,14 @@ class DataProcessor:
     def split_data_random(
         cls, 
         df: pd.DataFrame,
-        target_col: str,
+        target_col: Union[str, List[str]],
         test_size: float = 0.2,
         val_size: Optional[float] = None, 
         random_state: int = 42
-    ) -> Tuple[NDArray, NDArray, Optional[NDArray], NDArray, NDArray, Optional[NDArray]]:
+    ) -> Tuple[
+        pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame], 
+        pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]
+    ]:
         """Randomly split a DataFrame into train/test/(optional)validation sets.
 
         When `val_size` is provided the method returns three feature splits and
@@ -237,17 +318,20 @@ class DataProcessor:
         cls._validate_arguments_for_splitting(df, target_col, test_size, val_size)
         train_size = 1 - test_size - (val_size if val_size is not None else 0)
         
+        if isinstance(target_col, str):
+            target_col = [target_col]
+
         if val_size is not None:
             train_df, temp_df = train_test_split(df, test_size=(test_size + val_size), random_state=random_state)
             relative_val_size = val_size / (test_size + val_size)
             test_df, val_df = train_test_split(temp_df, test_size=relative_val_size, random_state=random_state + 1)
 
-            X_train = train_df.drop(columns=[target_col]).to_numpy()
-            X_test  = test_df.drop(columns=[target_col]).to_numpy()
-            X_val   = val_df.drop(columns=[target_col]).to_numpy()
-            y_train = train_df[target_col].to_numpy()
-            y_test  = test_df[target_col].to_numpy()
-            y_val   = val_df[target_col].to_numpy()
+            X_train = train_df.drop(columns=target_col)
+            X_test  = test_df.drop(columns=target_col)
+            X_val   = val_df.drop(columns=target_col)
+            y_train = train_df[target_col]
+            y_test  = test_df[target_col]
+            y_val   = val_df[target_col]
 
             logger.debug(
                 "Splitted data: train_dataset=%s (%.2f%%), test_dataset=%s (%.2f%%), val_dataset=%s (%.2f%%)",
@@ -256,10 +340,10 @@ class DataProcessor:
             return X_train, X_test, X_val, y_train, y_test, y_val
         else:
             train_df, test_df = train_test_split(df, test_size=test_size, random_state=random_state)
-            X_train = train_df.drop(columns=[target_col]).to_numpy()
-            X_test  = test_df.drop(columns=[target_col]).to_numpy()
-            y_train = train_df[target_col].to_numpy()
-            y_test  = test_df[target_col].to_numpy()
+            X_train = train_df.drop(columns=target_col)
+            X_test  = test_df.drop(columns=target_col)
+            y_train = train_df[target_col]
+            y_test  = test_df[target_col]
 
             logger.debug(
                 "Splitted data: train_dataset=%s (%.2f%%), test_dataset=%s (%.2f%%)",
@@ -271,10 +355,13 @@ class DataProcessor:
     def split_data_time_based(
         cls,
         df: pd.DataFrame,
-        target_col: str,
+        target_col: Union[str, List[str]],
         test_size: float = 0.2,
         val_size: Optional[float] = None,
-    ) -> Tuple[NDArray, NDArray, Optional[NDArray], NDArray, NDArray, Optional[NDArray]]:
+    ) -> Tuple[
+        pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame], 
+        pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]
+    ]:
         """Split a DataFrame into train/test/(optional)validation while preserving order.
 
         This method slices the DataFrame by index so that temporal order is not
@@ -293,6 +380,9 @@ class DataProcessor:
         cls._validate_arguments_for_splitting(df, target_col, test_size, val_size)
         train_size = 1 - test_size - (val_size if val_size is not None else 0)
 
+        if isinstance(target_col, str):
+            target_col = [target_col]
+
         n = len(df)
         if val_size is not None:
             n_train = int(n * train_size)
@@ -302,12 +392,12 @@ class DataProcessor:
             val_df   = df.iloc[n_train:n_train + n_val]
             test_df  = df.iloc[n_train + n_val:]
 
-            y_train = train_df[target_col].to_numpy()
-            y_test  = test_df[target_col].to_numpy()
-            y_val   = val_df[target_col].to_numpy()
-            X_train = train_df.drop(columns=[target_col]).to_numpy()
-            X_test  = test_df.drop(columns=[target_col]).to_numpy()
-            X_val   = val_df.drop(columns=[target_col]).to_numpy()
+            y_train = train_df[target_col]
+            y_test  = test_df[target_col]
+            y_val   = val_df[target_col]
+            X_train = train_df.drop(columns=target_col)
+            X_test  = test_df.drop(columns=target_col)
+            X_val   = val_df.drop(columns=target_col)
 
             logger.debug(
                 "Splitted data: train_dataset=%s (%.2f), test_dataset=%s (%.2f), val_dataset=%s (%.2f)",
@@ -319,10 +409,10 @@ class DataProcessor:
             train_df = df.iloc[:n_train]
             test_df  = df.iloc[n_train:]
 
-            y_train = train_df[target_col].to_numpy()
-            y_test  = test_df[target_col].to_numpy()
-            X_train = train_df.drop(columns=[target_col]).to_numpy()
-            X_test  = test_df.drop(columns=[target_col]).to_numpy()
+            y_train = train_df[target_col]
+            y_test  = test_df[target_col]
+            X_train = train_df.drop(columns=target_col)
+            X_test  = test_df.drop(columns=target_col)
 
             logger.debug(
                 "Splitted data: train_dataset=%s (%.2f), test_dataset=%s (%.2f)",
@@ -392,7 +482,7 @@ class DataProcessor:
     @staticmethod
     def _validate_arguments_for_splitting(
         df: pd.DataFrame,
-        target_col: str,
+        target_col: Union[str, List[str]],
         test_size: float,
         val_size: Optional[float] = None
     ) -> None:
@@ -416,12 +506,8 @@ class DataProcessor:
             raise ValueError("val_size must be between 0 and 1")
         if val_size is not None and (test_size + val_size) >= 1:
             raise ValueError("The sum of test_size and val_size must be less than 1")
-        if target_col not in df.columns:
-            raise ValueError(f"target_col '{target_col}' not found in DataFrame")
         if df.empty:
             raise ValueError("DataFrame is empty")
-        if not pd.api.types.is_numeric_dtype(df[target_col]):
-            raise ValueError(f"target_col '{target_col}' must be numeric")
 
     @staticmethod
     def sort_by_time(df: pd.DataFrame, time_col: str = "open_time", ascending: bool = True) -> pd.DataFrame:
@@ -537,7 +623,7 @@ class DataProcessor:
         return [(df.index[i], df.columns[j]) for i, j in zip(rows, cols)]
   
     @staticmethod
-    def check_no_duplicates(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    def check_no_duplicates(df: pd.DataFrame, columns: Optional[List[str]] = None) -> pd.DataFrame:
         """Identify duplicate rows in the DataFrame.
 
         The check considers duplicates based on the specified columns. It
@@ -547,10 +633,13 @@ class DataProcessor:
         Args:
             df: DataFrame to inspect.
             columns: List of column names to consider for identifying duplicates.
+                If None, all columns are used.
 
         Returns:
             A DataFrame containing the duplicate rows found.
         """
+        if columns is None:
+            columns = df.columns.tolist()
         if df.empty:
             raise ValueError("DataFrame is empty")
         for col in columns:
